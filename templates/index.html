@@ -1,10 +1,22 @@
 {% extends "base.html" %}
 {% block body %}
 <div class="layout">
-  <!-- LEFT PANEL -->
+  <!-- LEFT PANEL (client management) -->
   <aside class="left">
     <fieldset class="panel">
       <legend> Client Management </legend>
+
+      <form method="get" action="{{ url_for('index') }}">
+        <label for="client">Select Client</label>
+        <select id="client" name="client" onchange="this.form.submit()">
+          <option value="" {% if not current %}selected{% endif %}>-- saved clients --</option>
+          {% for c in clients %}
+          <option value="{{ c }}" {% if c == current %}selected{% endif %}>{{ c }}</option>
+          {% endfor %}
+        </select>
+        <noscript><button class="btn" type="submit">Open</button></noscript>
+      </form>
+
       <form method="post" action="{{ url_for('save_client_form') }}">
         <label for="name">Name</label>
         <input id="name" name="name" type="text" value="{{ form.name }}">
@@ -12,16 +24,25 @@
         <label for="age">Age</label>
         <input id="age" name="age" type="number" min="0" step="1" value="{{ form.age }}">
 
+        <label for="height">Height (cm)</label>
+        <input id="height" name="height" type="number" min="0" step="0.1" value="{{ form.height }}">
+
         <label for="weight">Weight (kg)</label>
         <input id="weight" name="weight" type="number" min="0" step="0.1" value="{{ form.weight }}">
 
         <label for="program">Program</label>
         <select id="program" name="program">
           <option value="" {% if not form.program %}selected{% endif %}>-- choose a program --</option>
-          {% for name in programs %}
-          <option value="{{ name }}" {% if name == form.program %}selected{% endif %}>{{ name }}</option>
+          {% for p in programs %}
+          <option value="{{ p }}" {% if p == form.program %}selected{% endif %}>{{ p }}</option>
           {% endfor %}
         </select>
+
+        <label for="target_weight">Target Weight (kg)</label>
+        <input id="target_weight" name="target_weight" type="number" min="0" step="0.1" value="{{ form.target_weight }}">
+
+        <label for="target_adherence">Target Adherence %</label>
+        <input id="target_adherence" name="target_adherence" type="number" min="0" max="100" step="1" value="{{ form.target_adherence }}">
 
         <label for="adherence">Weekly Adherence %:
           <output class="range-value" id="adherence-value">{{ form.adherence or 0 }}</output></label>
@@ -32,30 +53,55 @@
         <div class="btn-col">
           <button class="btn" type="submit">Save Client</button>
           <button class="btn" type="submit" formaction="{{ url_for('load_client_form') }}">Load Client</button>
-          <button class="btn" type="submit" formaction="{{ url_for('save_progress_form') }}">Save Progress</button>
-          <button class="btn" type="submit" formaction="{{ url_for('show_progress_chart_form') }}">View Progress Chart</button>
+          <button class="btn" type="submit" formaction="{{ url_for('save_progress_form') }}">Save Weekly Progress</button>
+          <button class="btn" type="submit" formmethod="get" formaction="{{ url_for('log_workout_page') }}">Log Workout</button>
+          <button class="btn" type="submit" formmethod="get" formaction="{{ url_for('log_metrics_page') }}">Log Body Metrics</button>
+          <button class="btn" type="submit" formmethod="get" formaction="{{ url_for('workout_history_page') }}">View Workout History</button>
         </div>
       </form>
     </fieldset>
   </aside>
 
-  <!-- RIGHT PANEL -->
+  <!-- RIGHT PANEL with tabs -->
   <section class="right">
-    <fieldset class="panel">
-      <legend> Client Summary </legend>
-      {% if summary %}
-      <pre class="display">{{ summary }}</pre>
-      {% else %}
-      <pre class="display placeholder">Save or load a client to see the summary</pre>
-      {% endif %}
-    </fieldset>
+    <nav class="tabs">
+      <a href="{{ url_for('index', client=current, tab='summary') }}" class="{{ 'active' if tab != 'analytics' }}">Client Summary</a>
+      <a href="{{ url_for('index', client=current, tab='analytics') }}" class="{{ 'active' if tab == 'analytics' }}">Progress &amp; Analytics</a>
+    </nav>
 
-    {% if show_chart %}
-    <fieldset class="panel chart">
-      <legend> Weekly Adherence Progress </legend>
-      <img src="{{ url_for('api_show_progress_chart', name=form.name) }}" alt="Line chart of weekly adherence for {{ form.name }}" width="800" height="400">
-    </fieldset>
+    <div class="tab-body">
+    {% if tab != 'analytics' %}
+      {% if summary %}
+      <pre class="display">{{ summary.text }}</pre>
+      {% else %}
+      <pre class="display placeholder">Select, save or load a client to see the summary</pre>
+      {% endif %}
+    {% else %}
+      {% if current %}
+      <div>
+        <a class="btn" href="{{ url_for('analytics', chart='progress', client=current) }}">Adherence Chart</a>
+        <a class="btn" href="{{ url_for('analytics', chart='weight', client=current) }}">Weight Trend Chart</a>
+        <a class="btn" href="{{ url_for('analytics', chart='bmi', client=current) }}">BMI &amp; Risk Info</a>
+      </div>
+      {% if chart == 'progress' %}
+      <fieldset class="panel chart"><legend> Weekly Adherence </legend>
+        <img src="{{ url_for('api_show_progress_chart', name=current) }}" alt="Weekly adherence chart for {{ current }}" width="800" height="400">
+      </fieldset>
+      {% elif chart == 'weight' %}
+      <fieldset class="panel chart"><legend> Weight Trend </legend>
+        <img src="{{ url_for('api_show_weight_chart', name=current) }}" alt="Weight trend chart for {{ current }}" width="800" height="400">
+      </fieldset>
+      {% elif chart == 'bmi' and bmi %}
+      <fieldset class="panel"><legend> BMI Info </legend>
+        <pre class="display">{{ bmi.message }}</pre>
+      </fieldset>
+      {% endif %}
+      {% else %}
+      <pre class="display placeholder">Select or load a client first</pre>
+      {% endif %}
     {% endif %}
+    </div>
   </section>
 </div>
 {% endblock %}
+{% block status %}{% include "_status.html" %}{% endblock %}

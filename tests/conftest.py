@@ -20,3 +20,12 @@ def db(app):
     """A database connection for calling the logic functions directly."""
     with app.app_context():
         yield get_db()
+
+
+@pytest.fixture
+def arjun(client):
+    """A saved client most tests can build on."""
+    client.post("/api/save_client", json={
+        "name": "Arjun", "age": 28, "height": 175, "weight": 80,
+        "program": "Fat Loss (FL) – 3 day", "target_weight": 72, "target_adherence": 85})
+    return "Arjun"
