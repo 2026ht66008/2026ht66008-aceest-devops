@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% block body %}
 <div class="layout">
-  <!-- LEFT PANEL - CLIENT PROFILE -->
+  <!-- LEFT PANEL -->
   <aside class="left">
     <fieldset class="panel">
-      <legend> Client Profile </legend>
-      <form method="get" action="{{ url_for('index') }}">
+      <legend> Client Management </legend>
+      <form method="post" action="{{ url_for('save_client_form') }}">
         <label for="name">Name</label>
         <input id="name" name="name" type="text" value="{{ form.name }}">
 
@@ -16,74 +16,37 @@
         <input id="weight" name="weight" type="number" min="0" step="0.1" value="{{ form.weight }}">
 
         <label for="program">Program</label>
-        <select id="program" name="program" onchange="this.form.submit()">
+        <select id="program" name="program">
           <option value="" {% if not form.program %}selected{% endif %}>-- choose a program --</option>
           {% for name in programs %}
           <option value="{{ name }}" {% if name == form.program %}selected{% endif %}>{{ name }}</option>
           {% endfor %}
         </select>
 
-        <label for="adherence">Weekly Adherence (%):
+        <label for="adherence">Weekly Adherence %:
           <output class="range-value" id="adherence-value">{{ form.adherence or 0 }}</output></label>
         <input id="adherence" name="adherence" type="range" min="0" max="100" step="1"
                value="{{ form.adherence or 0 }}"
                oninput="document.getElementById('adherence-value').value = this.value">
 
-        <label for="notes">Coach Notes</label>
-        <input id="notes" name="notes" type="text" value="{{ form.notes }}">
-
         <div class="btn-col">
-          <button class="btn" type="submit">Show Plan</button>
-          <button class="btn" type="submit" formmethod="post" formaction="{{ url_for('save_client_form') }}">Save Client</button>
-          <a class="btn" href="{{ url_for('export_csv_download') }}">Export CSV</a>
-          <a class="btn secondary" href="{{ url_for('index') }}">Reset</a>
+          <button class="btn" type="submit">Save Client</button>
+          <button class="btn" type="submit" formaction="{{ url_for('load_client_form') }}">Load Client</button>
+          <button class="btn" type="submit" formaction="{{ url_for('save_progress_form') }}">Save Progress</button>
         </div>
       </form>
     </fieldset>
   </aside>
 
-  <!-- RIGHT PANEL - PROGRAM DETAILS, CLIENT LIST, CHART -->
+  <!-- RIGHT PANEL -->
   <section class="right">
     <fieldset class="panel">
-      <legend> Weekly Training Plan </legend>
-      {% if plan %}
-      <pre class="display plan" style="color: {{ plan.color }}">{{ plan.workout }}</pre>
+      <legend> Client Summary </legend>
+      {% if summary %}
+      <pre class="display">{{ summary }}</pre>
       {% else %}
-      <pre class="display plan placeholder">Select a program to view the training plan</pre>
+      <pre class="display placeholder">Save or load a client to see the summary</pre>
       {% endif %}
-    </fieldset>
-
-    <fieldset class="panel">
-      <legend> Nutrition Plan </legend>
-      {% if plan %}
-      <pre class="display plan">{{ plan.diet }}</pre>
-      {% else %}
-      <pre class="display plan placeholder">Select a program to view the nutrition plan</pre>
-      {% endif %}
-    </fieldset>
-
-    <p class="calories">Estimated Calories:
-      {% if plan and plan.calories %}{{ plan.calories }} kcal{% else %}--{% endif %}</p>
-
-    <fieldset class="panel">
-      <legend> Client List </legend>
-      <div class="table-wrap">
-        <table class="grid">
-          <thead><tr><th>Name</th><th>Age</th><th>Weight</th><th>Program</th><th>Adherence</th><th>Notes</th></tr></thead>
-          <tbody>
-          {% for c in clients %}
-            <tr><td>{{ c.name }}</td><td>{{ c.age }}</td><td>{{ c.weight }}</td><td>{{ c.program }}</td><td>{{ c.adherence }}%</td><td>{{ c.notes }}</td></tr>
-          {% else %}
-            <tr><td class="empty" colspan="6">No clients saved yet</td></tr>
-          {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    </fieldset>
-
-    <fieldset class="panel chart">
-      <legend> Progress Chart </legend>
-      <img src="{{ url_for('api_update_chart', n=clients|length) }}" alt="Bar chart of weekly adherence per client" width="600" height="300">
     </fieldset>
   </section>
 </div>
