@@ -1,188 +1,228 @@
-"""Tests for ACEest v1.1.2 - in-memory client list, CSV export and progress chart."""
-import csv
-import io
+"""Tests for ACEest v2.0.1 - SQLite clients and weekly progress."""
+import re
+import sqlite3
+from datetime import datetime
 
 import pytest
 
-from app import (APP_VERSION, CSV_HEADER, ValidationError, calculate_calories, export_csv,
-                 parse_client, programs, to_number, update_chart, update_program)
+from app import (APP_VERSION, DB_NAME, NotFoundError, ValidationError, calculate_calories,
+                 client_summary, create_app, load_client, parse_client, programs,
+                 save_client, save_progress, setup_data, to_number)
 
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+WEEK_PATTERN = re.compile(r"^Week \d{2} - \d{4}$")
 
 
-def client_form(**overrides):
+def client_data(**overrides):
     data = {"name": "Arjun", "age": "28", "weight": "80", "program": "Fat Loss (FL)",
-            "adherence": "75", "notes": "Knee care"}
+            "adherence": "70"}
     data.update(overrides)
     return data
 
 
-def make_client(**overrides):
-    return parse_client(client_form(**overrides))
+# ---------- health / setup ----------
+
+def test_health_checks_database(client):
+    res = client.get("/health")
+    assert res.status_code == 200
+    assert res.get_json()["version"] == APP_VERSION
 
 
-# ---------- health ----------
+def test_default_database_name_matches_original():
+    assert DB_NAME == "aceest_fitness.db"
 
-def test_health_reports_version(client):
-    assert client.get("/health").get_json()["version"] == APP_VERSION
+
+def test_tables_are_created(app):
+    conn = sqlite3.connect(app.config["DATABASE"])
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    assert {"clients", "progress"} <= tables
+
+
+def test_database_directory_is_created(tmp_path):
+    path = tmp_path / "nested" / "dir" / "aceest.db"
+    create_app({"TESTING": True, "DATABASE": str(path)})
+    assert path.exists()
 
 
 # ---------- logic ----------
 
-@pytest.mark.parametrize("program,factor", [("Fat Loss (FL)", 22), ("Muscle Gain (MG)", 35),
-                                            ("Beginner (BG)", 26)])
-def test_calories_per_program(program, factor):
-    assert calculate_calories(70, program) == 70 * factor
+def test_setup_data_factors():
+    assert setup_data() == {"Fat Loss (FL)": {"factor": 22}, "Muscle Gain (MG)": {"factor": 35},
+                            "Beginner (BG)": {"factor": 26}}
 
 
-def test_update_program_short_plans():
-    plan = update_program("Muscle Gain (MG)", 0)
-    assert plan["workout"] == "Squat, Bench, Deadlift, Press, Rows"
-    assert plan["calories"] is None
-
-
-def test_update_program_unknown():
-    assert update_program("Yoga") is None
+@pytest.mark.parametrize("program", list(programs))
+def test_calculate_calories(program):
+    assert calculate_calories(75, program) == int(75 * programs[program]["factor"])
 
 
 @pytest.mark.parametrize("value,kind,maximum,message", [
-    ("abc", float, None, "must be a number"),
-    ("1.5", int, None, "must be a whole number"),
-    ("-1", int, None, "cannot be negative"),
-    ("150", int, 100, "between 0 and 100"),
+    ("x", float, None, "must be a number"), ("2.5", int, None, "whole number"),
+    ("-3", float, None, "negative"), ("101", int, 100, "between 0 and 100"),
 ])
-def test_to_number_invalid(value, kind, maximum, message):
+def test_to_number_rejects_bad_input(value, kind, maximum, message):
     with pytest.raises(ValidationError, match=message):
-        to_number(value, "Field", kind, maximum=maximum)
+        to_number(value, "Field", kind, maximum)
 
 
-def test_parse_client_includes_notes():
-    assert make_client()["notes"] == "Knee care"
+def test_save_and_load_client(db):
+    assert save_client(db, parse_client(client_data())) == "Client data saved"
+    client = load_client(db, "Arjun")
+    assert client == {"name": "Arjun", "age": 28, "weight": 80.0,
+                      "program": "Fat Loss (FL)", "calories": 80 * 22}
 
 
-def test_export_csv_has_original_header_and_rows():
-    rows = list(csv.reader(io.StringIO(export_csv([make_client(), make_client(name="Meena")]))))
-    assert rows[0] == CSV_HEADER
-    assert rows[1] == ["Arjun", "28", "80.0", "Fat Loss (FL)", "75", "Knee care"]
-    assert rows[2][0] == "Meena"
+def test_save_client_replaces_existing_row(db):
+    save_client(db, parse_client(client_data()))
+    save_client(db, parse_client(client_data(weight="90", program="Muscle Gain (MG)")))
+    assert load_client(db, "Arjun")["calories"] == 90 * 35
+    assert db.execute("SELECT COUNT(*) FROM clients").fetchone()[0] == 1
 
 
-def test_update_chart_returns_png_even_without_clients():
-    assert update_chart([]).startswith(PNG_MAGIC)
-    assert update_chart([make_client()]).startswith(PNG_MAGIC)
+@pytest.mark.parametrize("overrides", [{"name": ""}, {"program": ""}])
+def test_save_client_requires_name_and_program(db, overrides):
+    with pytest.raises(ValidationError, match="Name and Program required"):
+        save_client(db, parse_client(client_data(**overrides)))
+
+
+def test_save_client_unknown_program(db):
+    with pytest.raises(ValidationError, match="Unknown program"):
+        save_client(db, parse_client(client_data(program="Yoga")))
+
+
+def test_load_unknown_client(db):
+    with pytest.raises(NotFoundError, match="Client not found"):
+        load_client(db, "Nobody")
+
+
+def test_client_summary_text():
+    text = client_summary({"name": "Arjun", "age": 28, "weight": 80.0,
+                           "program": "Fat Loss (FL)", "calories": 1760})
+    assert text.startswith("CLIENT PROFILE\n--------------\n")
+    assert "Name     : Arjun" in text
+    assert "Calories : 1760 kcal/day" in text
+
+
+def test_save_progress_uses_week_label(db):
+    save_client(db, parse_client(client_data()))
+    message, week = save_progress(db, "Arjun", 80, now=datetime(2026, 10, 8))
+    assert message == "Weekly progress logged"
+    assert week == "Week 40 - 2026"
+    row = db.execute("SELECT client_name, week, adherence FROM progress").fetchone()
+    assert tuple(row) == ("Arjun", "Week 40 - 2026", 80)
+
+
+def test_save_progress_requires_name(db):
+    with pytest.raises(ValidationError, match="Enter client name first"):
+        save_progress(db, "", 50)
+
+
+def test_save_progress_unknown_client(db):
+    with pytest.raises(NotFoundError):
+        save_progress(db, "Nobody", 50)
 
 
 # ---------- web pages ----------
 
-def test_index_shows_header_and_empty_list(client):
+def test_index_renders_panels(client):
     html = client.get("/").get_data(as_text=True)
-    assert "ACEest FUNCTIONAL FITNESS SYSTEM v2" in html
-    assert "No clients saved yet" in html
-    assert "Coach Notes" in html
+    assert "ACEest Functional Fitness System" in html
+    assert "Client Management" in html and "Client Summary" in html
 
 
-def test_index_plan_and_calories(client):
-    html = client.get("/", query_string={"program": "Beginner (BG)", "weight": "60"}
-                      ).get_data(as_text=True)
-    assert "Air Squats, Ring Rows, Push-ups" in html
-    assert f"{60 * 26} kcal" in html
-
-
-def test_index_bad_weight_warns(client):
-    html = client.get("/", query_string={"program": "Beginner (BG)", "weight": "x"}
-                      ).get_data(as_text=True)
-    assert "Weight must be a number" in html
-
-
-def test_index_unknown_program_404(client):
-    assert client.get("/", query_string={"program": "Yoga"}).status_code == 404
-
-
-def test_save_client_form_adds_to_client_list(client):
-    res = client.post("/save_client", data=client_form(), follow_redirects=True)
+def test_save_client_form_then_summary(client):
+    res = client.post("/save_client", data=client_data(), follow_redirects=True)
     html = res.get_data(as_text=True)
-    assert "Client Arjun saved successfully." in html
-    assert "<td>Arjun</td>" in html
-    assert "<td>Knee care</td>" in html
+    assert "Client data saved" in html
+    assert "Calories : 1760 kcal/day" in html
 
 
-def test_save_client_form_missing_fields(client):
-    res = client.post("/save_client", data=client_form(program=""), follow_redirects=True)
-    assert "Please fill client name and program." in res.get_data(as_text=True)
-    assert client.get("/api/clients").get_json()["clients"] == []
+def test_save_client_form_error_keeps_fields(client):
+    res = client.post("/save_client", data=client_data(program=""), follow_redirects=True)
+    html = res.get_data(as_text=True)
+    assert "Name and Program required" in html
+    assert 'value="Arjun"' in html
 
 
-def test_export_csv_page_without_clients_warns(client):
-    res = client.get("/export_csv", follow_redirects=True)
-    assert "No clients to export." in res.get_data(as_text=True)
+def test_save_client_form_bad_number(client):
+    res = client.post("/save_client", data=client_data(age="abc"), follow_redirects=True)
+    assert "Age must be a whole number" in res.get_data(as_text=True)
 
 
-def test_export_csv_page_downloads_file(client):
-    client.post("/save_client", data=client_form())
-    res = client.get("/export_csv")
-    assert res.status_code == 200
-    assert res.mimetype == "text/csv"
-    assert "attachment; filename=clients.csv" in res.headers["Content-Disposition"]
-    assert res.get_data(as_text=True).startswith("Name,Age,Weight,Program,Adherence,Notes")
+def test_load_client_form(client):
+    client.post("/save_client", data=client_data())
+    res = client.post("/load_client", data={"name": "Arjun"}, follow_redirects=True)
+    assert "Name     : Arjun" in res.get_data(as_text=True)
+
+
+def test_load_client_form_not_found(client):
+    res = client.post("/load_client", data={"name": "Nobody"}, follow_redirects=True)
+    assert "Client not found" in res.get_data(as_text=True)
+
+
+def test_index_unknown_client_param(client):
+    res = client.get("/", query_string={"client": "Nobody"})
+    assert "Client not found" in res.get_data(as_text=True)
+
+
+def test_save_progress_form(client):
+    client.post("/save_client", data=client_data())
+    res = client.post("/save_progress", data={"name": "Arjun", "adherence": "85"},
+                      follow_redirects=True)
+    assert "Weekly progress logged" in res.get_data(as_text=True)
+
+
+def test_save_progress_form_without_name(client):
+    res = client.post("/save_progress", data={"name": "", "adherence": "85"},
+                      follow_redirects=True)
+    assert "Enter client name first" in res.get_data(as_text=True)
 
 
 # ---------- JSON API ----------
 
 def test_api_programs(client):
-    assert client.get("/api/programs").get_json()["programs"] == list(programs)
+    assert client.get("/api/programs").get_json()["programs"]["Muscle Gain (MG)"]["factor"] == 35
 
 
-def test_api_program_detail_and_unknown(client):
-    assert client.get("/api/programs/Fat Loss (FL)").get_json()["calorie_factor"] == 22
-    assert client.get("/api/programs/Yoga").status_code == 404
-
-
-def test_api_update_program(client):
-    ok = client.post("/api/update_program", json={"program": "Fat Loss (FL)", "weight": 50})
-    assert ok.get_json()["calories"] == 50 * 22
-    assert client.post("/api/update_program", json={"program": "Fat Loss (FL)",
-                                                    "weight": "x"}).status_code == 400
-    assert client.post("/api/update_program", json={"program": "Yoga"}).status_code == 404
-
-
-def test_api_save_client_and_list(client):
-    res = client.post("/api/save_client", json={"name": "Meena", "age": 30, "weight": 62,
-                                                "program": "Beginner (BG)", "adherence": 90})
+def test_api_save_and_load_client(client):
+    res = client.post("/api/save_client", json={"name": "Meena", "age": 30, "weight": 60,
+                                                "program": "Beginner (BG)"})
     assert res.status_code == 201
-    assert res.get_json()["message"] == "Client Meena saved successfully."
-    clients = client.get("/api/clients").get_json()["clients"]
-    assert [c["name"] for c in clients] == ["Meena"]
-
-
-def test_api_save_client_rejects_unknown_program(client):
-    res = client.post("/api/save_client", json={"name": "Meena", "program": "Yoga"})
-    assert res.status_code == 400
-    assert "Unknown program" in res.get_json()["error"]
+    assert res.get_json()["client"]["calories"] == 60 * 26
+    body = client.get("/api/load_client/Meena").get_json()
+    assert body["client"]["program"] == "Beginner (BG)"
+    assert "CLIENT PROFILE" in body["summary"]
 
 
 def test_api_save_client_validation(client):
-    assert client.post("/api/save_client", json={"name": "Meena"}).status_code == 400
+    res = client.post("/api/save_client", json={"name": "Meena"})
+    assert res.status_code == 400
+    assert res.get_json()["error"] == "Name and Program required"
 
 
-def test_api_export_csv(client):
-    assert client.get("/api/export_csv").status_code == 404
+def test_api_load_client_not_found(client):
+    res = client.get("/api/load_client/Nobody")
+    assert res.status_code == 404
+    assert res.get_json()["error"] == "Client not found"
+
+
+def test_api_save_progress(client):
     client.post("/api/save_client", json={"name": "Meena", "program": "Beginner (BG)"})
-    res = client.get("/api/export_csv")
-    assert res.status_code == 200 and "Meena" in res.get_data(as_text=True)
+    res = client.post("/api/save_progress", json={"name": "Meena", "adherence": 65})
+    body = res.get_json()
+    assert res.status_code == 201
+    assert body["message"] == "Weekly progress logged"
+    assert WEEK_PATTERN.match(body["week"])
 
 
-def test_api_update_chart_png(client):
-    res = client.get("/api/update_chart")
-    assert res.status_code == 200
-    assert res.mimetype == "image/png"
-    assert res.data.startswith(PNG_MAGIC)
-
-
-def test_clients_are_isolated_per_app_instance(app):
-    from app import create_app
-    other = create_app({"TESTING": True}).test_client()
-    app.test_client().post("/api/save_client", json={"name": "A", "program": "Beginner (BG)"})
-    assert other.get("/api/clients").get_json()["clients"] == []
+@pytest.mark.parametrize("payload,status", [
+    ({"name": "", "adherence": 50}, 400),
+    ({"name": "Meena", "adherence": 150}, 400),
+    ({"name": "Nobody", "adherence": 50}, 404),
+])
+def test_api_save_progress_errors(client, payload, status):
+    client.post("/api/save_client", json={"name": "Meena", "program": "Beginner (BG)"})
+    assert client.post("/api/save_progress", json=payload).status_code == status
 
 
 # ---------- errors ----------

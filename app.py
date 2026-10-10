@@ -1,58 +1,93 @@
-"""ACEest Fitness & Performance - v1.1.2 (Flask port of Aceestver1.1.2.py).
+"""ACEest Fitness & Performance - v2.0.1 (Flask port of Aceestver2.0.1.py).
 
 Same features as the Tkinter original:
-  * Client profile form: name, age, weight, program, weekly adherence, coach notes
-  * Selecting a program shows the training plan, nutrition plan and estimated calories
-  * Save Client stores the client in an in-memory list and adds it to the Client List
-  * Progress Chart: bar chart of adherence per client
-  * Export CSV: download all clients as a CSV file
-  * Reset clears the form
-  (The original's Reset button crashed and the file had no __main__ block;
-   both are fixed here.)
+  * Client management form: name, age, weight, program, weekly adherence
+  * Save Client: stores the client in SQLite (aceest_fitness.db) with the
+    calculated daily calories (weight x program factor)
+  * Load Client: shows the client profile in the Client Summary panel
+  * Save Progress: logs this week's adherence ("Week NN - YYYY")
 
-Web pages:  GET  /                       -> client profile, plan, client list, chart
-            POST /save_client            -> form submit
-            GET  /export_csv             -> CSV download (or a warning if empty)
-JSON API:   GET  /api/programs[/<name>]  -> program names / details
-            POST /api/update_program     -> plan + calories
-            GET  /api/clients            -> saved clients
-            POST /api/save_client        -> add a client
-            GET  /api/export_csv         -> CSV
-            GET  /api/update_chart       -> PNG bar chart of adherence
-Health:     GET  /health
-
-Note: clients live in memory (as in the original), so they reset when the
-app restarts. Persistent storage arrives in v2.0.1 (SQLite).
+Web pages:  GET  /                         -> client management + summary (?client=<name>)
+            POST /save_client | /load_client | /save_progress
+JSON API:   GET  /api/programs             -> programs and calorie factors
+            POST /api/save_client          -> create or replace a client
+            GET  /api/load_client/<name>   -> client profile + summary text
+            POST /api/save_progress        -> log weekly adherence
+Health:     GET  /health                   -> also checks the database
 """
-import csv
-import io
 import math
 import os
+import sqlite3
+from datetime import datetime
 
-from flask import (Flask, Response, current_app, flash, jsonify, redirect,
-                   render_template, request, url_for)
-from matplotlib.figure import Figure
+from flask import (Flask, current_app, flash, g, jsonify, redirect, render_template,
+                   request, url_for)
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "2.0.1"
 APP_TITLE = "ACEest Fitness & Performance"
-HEADER_TEXT = "ACEest FUNCTIONAL FITNESS SYSTEM v2"
-CSV_HEADER = ["Name", "Age", "Weight", "Program", "Adherence", "Notes"]
+HEADER_TEXT = "ACEest Functional Fitness System"
+DB_NAME = "aceest_fitness.db"
 
-programs = {
-    "Fat Loss (FL)": {"workout": "Back Squat, Cardio, Bench, Deadlift, Recovery",
-                      "diet": "Egg Whites, Chicken, Fish Curry",
-                      "color": "#e74c3c", "calorie_factor": 22},
-    "Muscle Gain (MG)": {"workout": "Squat, Bench, Deadlift, Press, Rows",
-                         "diet": "Eggs, Biryani, Mutton Curry",
-                         "color": "#2ecc71", "calorie_factor": 35},
-    "Beginner (BG)": {"workout": "Air Squats, Ring Rows, Push-ups",
-                      "diet": "Balanced Tamil Meals",
-                      "color": "#3498db", "calorie_factor": 26},
-}
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    age INTEGER,
+    weight REAL,
+    program TEXT,
+    calories INTEGER
+);
+CREATE TABLE IF NOT EXISTS progress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_name TEXT,
+    week TEXT,
+    adherence INTEGER
+);
+"""
+FORM_FIELDS = ("name", "age", "weight", "program", "adherence")
 
 
 class ValidationError(ValueError):
-    """Invalid client input - shown as a warning on the page or HTTP 400 in the API."""
+    """Invalid input - shown as a warning on the page or HTTP 400 in the API."""
+
+
+class NotFoundError(LookupError):
+    """Requested client does not exist - warning on the page or HTTP 404 in the API."""
+
+
+# ---------- DATABASE ----------
+
+def init_db(conn):
+    """Create the tables if they do not exist (same schema as the original)."""
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+
+def get_db():
+    """One SQLite connection per request, closed automatically afterwards."""
+    if "db" not in g:
+        g.db = sqlite3.connect(current_app.config["DATABASE"])
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+def close_db(_exc=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+# ---------- DATA ----------
+
+def setup_data():
+    return {
+        "Fat Loss (FL)": {"factor": 22},
+        "Muscle Gain (MG)": {"factor": 35},
+        "Beginner (BG)": {"factor": 26},
+    }
+
+
+programs = setup_data()
 
 
 # ---------- LOGIC ----------
@@ -75,21 +110,6 @@ def to_number(value, field, kind=float, maximum=None):
     return number
 
 
-def calculate_calories(weight, program):
-    """Estimated daily calories = weight (kg) x the program's calorie factor."""
-    return int(weight * programs[program]["calorie_factor"])
-
-
-def update_program(program, weight=0.0):
-    """Plan for a program plus estimated calories (None until a weight is entered)."""
-    data = programs.get(program)
-    if data is None:
-        return None
-    calories = calculate_calories(weight, program) if weight > 0 else None
-    return {"name": program, "workout": data["workout"], "diet": data["diet"],
-            "color": data["color"], "calories": calories}
-
-
 def parse_client(data):
     """Read and type-check the client fields from a form or JSON body."""
     return {
@@ -97,54 +117,62 @@ def parse_client(data):
         "age": to_number(data.get("age"), "Age", int),
         "weight": to_number(data.get("weight"), "Weight", float),
         "program": (data.get("program") or "").strip(),
-        "adherence": to_number(data.get("adherence"), "Weekly adherence", int, maximum=100),
-        "notes": (data.get("notes") or "").strip(),
     }
 
 
-def get_clients():
-    """The in-memory client list of the running app (self.clients in the original)."""
-    return current_app.extensions["aceest_clients"]
+def calculate_calories(weight, program):
+    return int(weight * programs[program]["factor"])
 
 
-def save_client(client):
-    """Validate, store and confirm a client (same messages as the original)."""
+def save_client(db, client):
+    """Create or replace a client row with its calculated calories."""
     if not client["name"] or not client["program"]:
-        raise ValidationError("Please fill client name and program.")
+        raise ValidationError("Name and Program required")
     if client["program"] not in programs:
         raise ValidationError(f"Unknown program: {client['program']}")
-    get_clients().append(client)
-    return f"Client {client['name']} saved successfully."
+    calories = calculate_calories(client["weight"], client["program"])
+    db.execute(
+        "INSERT OR REPLACE INTO clients (name, age, weight, program, calories) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (client["name"], client["age"], client["weight"], client["program"], calories),
+    )
+    db.commit()
+    return "Client data saved"
 
 
-def export_csv(clients):
-    """CSV text with the same header row as the original export."""
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(CSV_HEADER)
-    for c in clients:
-        writer.writerow([c["name"], c["age"], c["weight"], c["program"],
-                         c["adherence"], c["notes"]])
-    return buffer.getvalue()
+def load_client(db, name):
+    """Return the client as a dict, or raise NotFoundError."""
+    row = db.execute(
+        "SELECT name, age, weight, program, calories FROM clients WHERE name = ?", (name,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError("Client not found")
+    return dict(row)
 
 
-def update_chart(clients):
-    """PNG bar chart of adherence per client - the original's 'Client Progress' chart."""
-    fig = Figure(figsize=(6, 3))
-    ax = fig.subplots()
-    ax.bar([c["name"] for c in clients], [c["adherence"] for c in clients], color="#d4af37")
-    ax.set_ylabel("Adherence %")
-    ax.set_title("Client Progress")
-    ax.set_ylim(0, 100)
-    fig.tight_layout()
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png")
-    return buffer.getvalue()
+def client_summary(client):
+    """The CLIENT PROFILE text block shown in the Client Summary panel."""
+    return (
+        "CLIENT PROFILE\n"
+        "--------------\n"
+        f"Name     : {client['name']}\n"
+        f"Age      : {client['age']}\n"
+        f"Weight   : {client['weight']} kg\n"
+        f"Program  : {client['program']}\n"
+        f"Calories : {client['calories']} kcal/day\n"
+    )
 
 
-def csv_response(text):
-    return Response(text, mimetype="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=clients.csv"})
+def save_progress(db, name, adherence, now=None):
+    """Log this week's adherence for a client; returns (message, week label)."""
+    if not name:
+        raise ValidationError("Enter client name first")
+    load_client(db, name)  # raises NotFoundError for unknown clients
+    week = (now or datetime.now()).strftime("Week %U - %Y")
+    db.execute("INSERT INTO progress (client_name, week, adherence) VALUES (?, ?, ?)",
+               (name, week, adherence))
+    db.commit()
+    return "Weekly progress logged", week
 
 
 # ---------- APP ----------
@@ -154,10 +182,17 @@ def create_app(test_config=None):
     app = Flask(__name__)
     app.config.from_mapping(
         SECRET_KEY=os.environ.get("ACEEST_SECRET_KEY", "dev-only-change-me"),
+        DATABASE=os.environ.get("ACEEST_DB", DB_NAME),
     )
     if test_config:
         app.config.update(test_config)
-    app.extensions["aceest_clients"] = []  # store multiple clients (in memory)
+
+    db_dir = os.path.dirname(os.path.abspath(app.config["DATABASE"]))
+    os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(app.config["DATABASE"])
+    init_db(conn)
+    conn.close()
+    app.teardown_appcontext(close_db)
 
     @app.context_processor
     def inject_globals():
@@ -165,90 +200,96 @@ def create_app(test_config=None):
 
     @app.get("/health")
     def health():
+        get_db().execute("SELECT 1").fetchone()
         return jsonify(status="ok", app=APP_TITLE, version=APP_VERSION)
 
     # ---------- WEB PAGES ----------
     @app.get("/")
     def index():
-        form = {key: request.args.get(key, "") for key in
-                ("name", "age", "weight", "program", "adherence", "notes")}
-        plan, status = None, 200
-        if form["program"]:
+        form = {key: request.args.get(key, "") for key in FORM_FIELDS}
+        summary = None
+        name = request.args.get("client", "")
+        if name:
             try:
-                weight = to_number(form["weight"], "Weight")
-            except ValidationError as err:
+                client = load_client(get_db(), name)
+            except NotFoundError as err:
                 flash(str(err), "warning")
-                weight = 0.0
-            plan = update_program(form["program"], weight)
-            if plan is None:
-                flash(f"Unknown program: {form['program']}", "error")
-                form["program"], status = "", 404
-        return render_template("index.html", programs=programs, form=form, plan=plan,
-                               clients=get_clients()), status
+            else:
+                form.update({k: client[k] for k in ("name", "age", "weight", "program")})
+                summary = client_summary(client)
+        return render_template("index.html", programs=programs, form=form, summary=summary)
+
+    def back_to_form(**extra):
+        keep = {key: request.form.get(key, "") for key in FORM_FIELDS}
+        keep.update(extra)
+        return redirect(url_for("index", **keep))
 
     @app.post("/save_client")
     def save_client_form():
         try:
-            flash(save_client(parse_client(request.form)), "success")
+            client = parse_client(request.form)
+            flash(save_client(get_db(), client), "success")
         except ValidationError as err:
-            flash(str(err), "warning")
-        keep = {key: request.form.get(key, "") for key in
-                ("name", "age", "weight", "program", "adherence", "notes")}
-        return redirect(url_for("index", **keep))
+            flash(str(err), "error")
+            return back_to_form()
+        return redirect(url_for("index", client=client["name"]))
 
-    @app.get("/export_csv")
-    def export_csv_download():
-        if not get_clients():
-            flash("No clients to export.", "warning")
-            return redirect(url_for("index"))
-        return csv_response(export_csv(get_clients()))
+    @app.post("/load_client")
+    def load_client_form():
+        name = request.form.get("name", "").strip()
+        try:
+            load_client(get_db(), name)
+        except NotFoundError as err:
+            flash(str(err), "warning")
+            return back_to_form()
+        return redirect(url_for("index", client=name))
+
+    @app.post("/save_progress")
+    def save_progress_form():
+        name = request.form.get("name", "").strip()
+        try:
+            adherence = to_number(request.form.get("adherence"), "Weekly adherence", int, 100)
+            message, _week = save_progress(get_db(), name, adherence)
+        except (ValidationError, NotFoundError) as err:
+            flash(str(err), "warning")
+            return back_to_form()
+        flash(message, "success")
+        return redirect(url_for("index", client=name))
 
     # ---------- JSON API ----------
     @app.get("/api/programs")
     def api_programs():
-        return jsonify(programs=list(programs.keys()))
-
-    @app.get("/api/programs/<path:name>")
-    def api_program(name):
-        if name not in programs:
-            return jsonify(error=f"Unknown program: {name}"), 404
-        return jsonify(name=name, **programs[name])
-
-    @app.post("/api/update_program")
-    def api_update_program():
-        body = request.get_json(silent=True) or {}
-        try:
-            weight = to_number(body.get("weight"), "Weight")
-        except ValidationError as err:
-            return jsonify(error=str(err)), 400
-        plan = update_program(body.get("program", ""), weight)
-        if plan is None:
-            return jsonify(error=f"Unknown program: {body.get('program', '')}"), 404
-        return jsonify(plan)
-
-    @app.get("/api/clients")
-    def api_clients():
-        return jsonify(clients=get_clients())
+        return jsonify(programs=programs)
 
     @app.post("/api/save_client")
     def api_save_client():
         body = request.get_json(silent=True) or {}
         try:
             client = parse_client(body)
-            message = save_client(client)
+            message = save_client(get_db(), client)
         except ValidationError as err:
             return jsonify(error=str(err)), 400
-        return jsonify(message=message, client=client), 201
+        return jsonify(message=message, client=load_client(get_db(), client["name"])), 201
 
-    @app.get("/api/export_csv")
-    def api_export_csv():
-        if not get_clients():
-            return jsonify(error="No clients to export."), 404
-        return csv_response(export_csv(get_clients()))
+    @app.get("/api/load_client/<path:name>")
+    def api_load_client(name):
+        try:
+            client = load_client(get_db(), name)
+        except NotFoundError as err:
+            return jsonify(error=str(err)), 404
+        return jsonify(client=client, summary=client_summary(client))
 
-    @app.get("/api/update_chart")
-    def api_update_chart():
-        return Response(update_chart(get_clients()), mimetype="image/png")
+    @app.post("/api/save_progress")
+    def api_save_progress():
+        body = request.get_json(silent=True) or {}
+        try:
+            adherence = to_number(body.get("adherence"), "Weekly adherence", int, 100)
+            message, week = save_progress(get_db(), (body.get("name") or "").strip(), adherence)
+        except ValidationError as err:
+            return jsonify(error=str(err)), 400
+        except NotFoundError as err:
+            return jsonify(error=str(err)), 404
+        return jsonify(message=message, week=week, adherence=adherence), 201
 
     # ---------- ERRORS ----------
     def wants_json():
