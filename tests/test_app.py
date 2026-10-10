@@ -1,4 +1,4 @@
-"""Tests for ACEest v2.0.1 - SQLite clients and weekly progress."""
+"""Tests for ACEest v2.1.2 - SQLite clients and weekly progress."""
 import re
 import sqlite3
 from datetime import datetime
