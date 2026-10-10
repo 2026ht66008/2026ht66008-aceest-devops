@@ -1,83 +1,53 @@
-"""ACEest Fitness & Performance - v1.1 (Flask port of Aceestver-1.1.py).
+"""ACEest Fitness & Performance - v1.1.2 (Flask port of Aceestver1.1.2.py).
 
 Same features as the Tkinter original:
-  * Client profile form: name, age, weight, program, weekly adherence (%)
-  * Selecting a program shows its weekly training plan (in the program colour),
-    its nutrition plan (TN context) and the estimated calories
-    (weight x program calorie factor)
-  * Save Client validates the form and confirms the adherence
-    (like the original, nothing is stored yet - storage arrives in v1.1.2)
+  * Client profile form: name, age, weight, program, weekly adherence, coach notes
+  * Selecting a program shows the training plan, nutrition plan and estimated calories
+  * Save Client stores the client in an in-memory list and adds it to the Client List
+  * Progress Chart: bar chart of adherence per client
+  * Export CSV: download all clients as a CSV file
   * Reset clears the form
+  (The original's Reset button crashed and the file had no __main__ block;
+   both are fixed here.)
 
-Web pages:  GET  /                          -> client profile + plan
-            POST /save_client               -> form submit (redirects back with a message)
-JSON API:   GET  /api/programs              -> program names
-            GET  /api/programs/<name>       -> plan details incl. calorie factor
-            POST /api/update_program        -> {"program", "weight"} -> plan + calories
-            POST /api/save_client           -> validate a client
+Web pages:  GET  /                       -> client profile, plan, client list, chart
+            POST /save_client            -> form submit
+            GET  /export_csv             -> CSV download (or a warning if empty)
+JSON API:   GET  /api/programs[/<name>]  -> program names / details
+            POST /api/update_program     -> plan + calories
+            GET  /api/clients            -> saved clients
+            POST /api/save_client        -> add a client
+            GET  /api/export_csv         -> CSV
+            GET  /api/update_chart       -> PNG bar chart of adherence
 Health:     GET  /health
+
+Note: clients live in memory (as in the original), so they reset when the
+app restarts. Persistent storage arrives in v2.0.1 (SQLite).
 """
+import csv
+import io
 import math
 import os
 
-from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
+from flask import (Flask, Response, current_app, flash, jsonify, redirect,
+                   render_template, request, url_for)
+from matplotlib.figure import Figure
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.1.2"
 APP_TITLE = "ACEest Fitness & Performance"
-HEADER_TEXT = "ACEest FUNCTIONAL FITNESS SYSTEM"
+HEADER_TEXT = "ACEest FUNCTIONAL FITNESS SYSTEM v2"
+CSV_HEADER = ["Name", "Age", "Weight", "Program", "Adherence", "Notes"]
 
 programs = {
-    "Fat Loss (FL)": {
-        "workout": (
-            "Mon: Back Squat 5x5 + Core\n"
-            "Tue: EMOM 20min Assault Bike\n"
-            "Wed: Bench Press + 21-15-9\n"
-            "Thu: Deadlift + Box Jumps\n"
-            "Fri: Zone 2 Cardio 30min"
-        ),
-        "diet": (
-            "Breakfast: Egg Whites + Oats\n"
-            "Lunch: Grilled Chicken + Brown Rice\n"
-            "Dinner: Fish Curry + Millet Roti\n"
-            "Target: ~2000 kcal"
-        ),
-        "color": "#e74c3c",
-        "calorie_factor": 22,
-    },
-    "Muscle Gain (MG)": {
-        "workout": (
-            "Mon: Squat 5x5\n"
-            "Tue: Bench 5x5\n"
-            "Wed: Deadlift 4x6\n"
-            "Thu: Front Squat 4x8\n"
-            "Fri: Incline Press 4x10\n"
-            "Sat: Barbell Rows 4x10"
-        ),
-        "diet": (
-            "Breakfast: Eggs + Peanut Butter Oats\n"
-            "Lunch: Chicken Biryani\n"
-            "Dinner: Mutton Curry + Rice\n"
-            "Target: ~3200 kcal"
-        ),
-        "color": "#2ecc71",
-        "calorie_factor": 35,
-    },
-    "Beginner (BG)": {
-        "workout": (
-            "Full Body Circuit:\n"
-            "- Air Squats\n"
-            "- Ring Rows\n"
-            "- Push-ups\n"
-            "Focus: Technique & Consistency"
-        ),
-        "diet": (
-            "Balanced Tamil Meals\n"
-            "Idli / Dosa / Rice + Dal\n"
-            "Protein Target: 120g/day"
-        ),
-        "color": "#3498db",
-        "calorie_factor": 26,
-    },
+    "Fat Loss (FL)": {"workout": "Back Squat, Cardio, Bench, Deadlift, Recovery",
+                      "diet": "Egg Whites, Chicken, Fish Curry",
+                      "color": "#e74c3c", "calorie_factor": 22},
+    "Muscle Gain (MG)": {"workout": "Squat, Bench, Deadlift, Press, Rows",
+                         "diet": "Eggs, Biryani, Mutton Curry",
+                         "color": "#2ecc71", "calorie_factor": 35},
+    "Beginner (BG)": {"workout": "Air Squats, Ring Rows, Push-ups",
+                      "diet": "Balanced Tamil Meals",
+                      "color": "#3498db", "calorie_factor": 26},
 }
 
 
@@ -85,7 +55,7 @@ class ValidationError(ValueError):
     """Invalid client input - shown as a warning on the page or HTTP 400 in the API."""
 
 
-# ---------- LOGIC (no Flask here, so it is easy to unit test) ----------
+# ---------- LOGIC ----------
 
 def to_number(value, field, kind=float, maximum=None):
     """Convert form/JSON input to a non-negative number. Blank means 0 (like Tk IntVar)."""
@@ -121,24 +91,60 @@ def update_program(program, weight=0.0):
 
 
 def parse_client(data):
-    """Read and type-check the client profile fields from a form or JSON body."""
+    """Read and type-check the client fields from a form or JSON body."""
     return {
         "name": (data.get("name") or "").strip(),
         "age": to_number(data.get("age"), "Age", int),
         "weight": to_number(data.get("weight"), "Weight", float),
         "program": (data.get("program") or "").strip(),
         "adherence": to_number(data.get("adherence"), "Weekly adherence", int, maximum=100),
+        "notes": (data.get("notes") or "").strip(),
     }
 
 
+def get_clients():
+    """The in-memory client list of the running app (self.clients in the original)."""
+    return current_app.extensions["aceest_clients"]
+
+
 def save_client(client):
-    """Validate a client like the original Save Client button and return the message."""
+    """Validate, store and confirm a client (same messages as the original)."""
     if not client["name"] or not client["program"]:
         raise ValidationError("Please fill client name and program.")
     if client["program"] not in programs:
         raise ValidationError(f"Unknown program: {client['program']}")
-    return (f"Client {client['name']} saved successfully.\n"
-            f"Adherence: {client['adherence']}%")
+    get_clients().append(client)
+    return f"Client {client['name']} saved successfully."
+
+
+def export_csv(clients):
+    """CSV text with the same header row as the original export."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(CSV_HEADER)
+    for c in clients:
+        writer.writerow([c["name"], c["age"], c["weight"], c["program"],
+                         c["adherence"], c["notes"]])
+    return buffer.getvalue()
+
+
+def update_chart(clients):
+    """PNG bar chart of adherence per client - the original's 'Client Progress' chart."""
+    fig = Figure(figsize=(6, 3))
+    ax = fig.subplots()
+    ax.bar([c["name"] for c in clients], [c["adherence"] for c in clients], color="#d4af37")
+    ax.set_ylabel("Adherence %")
+    ax.set_title("Client Progress")
+    ax.set_ylim(0, 100)
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png")
+    return buffer.getvalue()
+
+
+def csv_response(text):
+    return Response(text, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=clients.csv"})
 
 
 # ---------- APP ----------
@@ -151,6 +157,7 @@ def create_app(test_config=None):
     )
     if test_config:
         app.config.update(test_config)
+    app.extensions["aceest_clients"] = []  # store multiple clients (in memory)
 
     @app.context_processor
     def inject_globals():
@@ -164,7 +171,7 @@ def create_app(test_config=None):
     @app.get("/")
     def index():
         form = {key: request.args.get(key, "") for key in
-                ("name", "age", "weight", "program", "adherence")}
+                ("name", "age", "weight", "program", "adherence", "notes")}
         plan, status = None, 200
         if form["program"]:
             try:
@@ -176,7 +183,8 @@ def create_app(test_config=None):
             if plan is None:
                 flash(f"Unknown program: {form['program']}", "error")
                 form["program"], status = "", 404
-        return render_template("index.html", programs=programs, form=form, plan=plan), status
+        return render_template("index.html", programs=programs, form=form, plan=plan,
+                               clients=get_clients()), status
 
     @app.post("/save_client")
     def save_client_form():
@@ -184,10 +192,16 @@ def create_app(test_config=None):
             flash(save_client(parse_client(request.form)), "success")
         except ValidationError as err:
             flash(str(err), "warning")
-        # Keep what the user typed (the Tk window kept its field values too)
         keep = {key: request.form.get(key, "") for key in
-                ("name", "age", "weight", "program", "adherence")}
+                ("name", "age", "weight", "program", "adherence", "notes")}
         return redirect(url_for("index", **keep))
+
+    @app.get("/export_csv")
+    def export_csv_download():
+        if not get_clients():
+            flash("No clients to export.", "warning")
+            return redirect(url_for("index"))
+        return csv_response(export_csv(get_clients()))
 
     # ---------- JSON API ----------
     @app.get("/api/programs")
@@ -212,6 +226,10 @@ def create_app(test_config=None):
             return jsonify(error=f"Unknown program: {body.get('program', '')}"), 404
         return jsonify(plan)
 
+    @app.get("/api/clients")
+    def api_clients():
+        return jsonify(clients=get_clients())
+
     @app.post("/api/save_client")
     def api_save_client():
         body = request.get_json(silent=True) or {}
@@ -220,7 +238,17 @@ def create_app(test_config=None):
             message = save_client(client)
         except ValidationError as err:
             return jsonify(error=str(err)), 400
-        return jsonify(message=message, client=client)
+        return jsonify(message=message, client=client), 201
+
+    @app.get("/api/export_csv")
+    def api_export_csv():
+        if not get_clients():
+            return jsonify(error="No clients to export."), 404
+        return csv_response(export_csv(get_clients()))
+
+    @app.get("/api/update_chart")
+    def api_update_chart():
+        return Response(update_chart(get_clients()), mimetype="image/png")
 
     # ---------- ERRORS ----------
     def wants_json():
