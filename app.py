@@ -1,30 +1,33 @@
-"""ACEest Fitness & Performance - v2.1.2 (Flask port of Aceestver-2.1.2.py).
+"""ACEest Fitness & Performance - v2.2.1 (Flask port of Aceestver-2.2.1.py).
 
-The original 2.1.2 script is identical to 2.0.1, so this release changes only the
-version number. Same features as the Tkinter original:
+Same features as the Tkinter original:
   * Client management form: name, age, weight, program, weekly adherence
   * Save Client: stores the client in SQLite (aceest_fitness.db) with the
     calculated daily calories (weight x program factor)
   * Load Client: shows the client profile in the Client Summary panel
   * Save Progress: logs this week's adherence ("Week NN - YYYY")
+  * NEW in 2.2.1 - View Progress Chart: line chart of weekly adherence for a client
 
-Web pages:  GET  /                         -> client management + summary (?client=<name>)
-            POST /save_client | /load_client | /save_progress
-JSON API:   GET  /api/programs             -> programs and calorie factors
-            POST /api/save_client          -> create or replace a client
-            GET  /api/load_client/<name>   -> client profile + summary text
-            POST /api/save_progress        -> log weekly adherence
-Health:     GET  /health                   -> also checks the database
+Web pages:  GET  /                                  -> client management + summary
+            POST /save_client | /load_client | /save_progress | /show_progress_chart
+JSON API:   GET  /api/programs                      -> programs and calorie factors
+            POST /api/save_client                   -> create or replace a client
+            GET  /api/load_client/<name>            -> client profile + summary text
+            POST /api/save_progress                 -> log weekly adherence
+            GET  /api/show_progress_chart/<name>    -> PNG adherence chart
+Health:     GET  /health                            -> also checks the database
 """
+import io
 import math
 import os
 import sqlite3
 from datetime import datetime
 
-from flask import (Flask, current_app, flash, g, jsonify, redirect, render_template,
-                   request, url_for)
+from flask import (Flask, Response, current_app, flash, g, jsonify, redirect,
+                   render_template, request, url_for)
+from matplotlib.figure import Figure
 
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.2.1"
 APP_TITLE = "ACEest Fitness & Performance"
 HEADER_TEXT = "ACEest Functional Fitness System"
 DB_NAME = "aceest_fitness.db"
@@ -156,11 +159,11 @@ def client_summary(client):
     return (
         "CLIENT PROFILE\n"
         "--------------\n"
-        f"Name     : {client['name']}\n"
-        f"Age      : {client['age']}\n"
-        f"Weight   : {client['weight']} kg\n"
-        f"Program  : {client['program']}\n"
-        f"Calories : {client['calories']} kcal/day\n"
+        f"Name      : {client['name']}\n"
+        f"Age       : {client['age']}\n"
+        f"Weight    : {client['weight']} kg\n"
+        f"Program   : {client['program']}\n"
+        f"Calories  : {client['calories']} kcal/day\n"
     )
 
 
@@ -174,6 +177,31 @@ def save_progress(db, name, adherence, now=None):
                (name, week, adherence))
     db.commit()
     return "Weekly progress logged", week
+
+
+def show_progress_chart(db, name):
+    """PNG line chart of weekly adherence (same look as the original matplotlib window)."""
+    if not name:
+        raise ValidationError("Enter client name first")
+    data = db.execute(
+        "SELECT week, adherence FROM progress WHERE client_name = ? ORDER BY id", (name,)
+    ).fetchall()
+    if not data:
+        raise NotFoundError("No progress data available for this client")
+    fig = Figure(figsize=(8, 4))
+    ax = fig.subplots()
+    ax.plot([row["week"] for row in data], [row["adherence"] for row in data],
+            marker="o", linewidth=2)
+    ax.set_title(f"Weekly Adherence Progress \u2013 {name}")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Adherence (%)")
+    ax.set_ylim(0, 100)
+    ax.grid(True)
+    ax.tick_params(axis="x", labelrotation=45)
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png")
+    return buffer.getvalue()
 
 
 # ---------- APP ----------
@@ -208,7 +236,7 @@ def create_app(test_config=None):
     @app.get("/")
     def index():
         form = {key: request.args.get(key, "") for key in FORM_FIELDS}
-        summary = None
+        summary, show_chart = None, False
         name = request.args.get("client", "")
         if name:
             try:
@@ -218,7 +246,9 @@ def create_app(test_config=None):
             else:
                 form.update({k: client[k] for k in ("name", "age", "weight", "program")})
                 summary = client_summary(client)
-        return render_template("index.html", programs=programs, form=form, summary=summary)
+                show_chart = request.args.get("chart") == "progress"
+        return render_template("index.html", programs=programs, form=form, summary=summary,
+                               show_chart=show_chart)
 
     def back_to_form(**extra):
         keep = {key: request.form.get(key, "") for key in FORM_FIELDS}
@@ -257,6 +287,19 @@ def create_app(test_config=None):
         flash(message, "success")
         return redirect(url_for("index", client=name))
 
+    @app.post("/show_progress_chart")
+    def show_progress_chart_form():
+        name = request.form.get("name", "").strip()
+        try:
+            show_progress_chart(get_db(), name)
+        except ValidationError as err:
+            flash(str(err), "warning")
+            return back_to_form()
+        except NotFoundError as err:
+            flash(str(err), "info")
+            return redirect(url_for("index", client=name))
+        return redirect(url_for("index", client=name, chart="progress"))
+
     # ---------- JSON API ----------
     @app.get("/api/programs")
     def api_programs():
@@ -291,6 +334,14 @@ def create_app(test_config=None):
         except NotFoundError as err:
             return jsonify(error=str(err)), 404
         return jsonify(message=message, week=week, adherence=adherence), 201
+
+    @app.get("/api/show_progress_chart/<path:name>")
+    def api_show_progress_chart(name):
+        try:
+            png = show_progress_chart(get_db(), name)
+        except NotFoundError as err:
+            return jsonify(error=str(err)), 404
+        return Response(png, mimetype="image/png")
 
     # ---------- ERRORS ----------
     def wants_json():

@@ -1,4 +1,4 @@
-"""Tests for ACEest v2.1.2 - SQLite clients and weekly progress."""
+"""Tests for ACEest v2.2.1 - SQLite clients, weekly progress and progress chart."""
 import re
 import sqlite3
 from datetime import datetime
@@ -7,7 +7,9 @@ import pytest
 
 from app import (APP_VERSION, DB_NAME, NotFoundError, ValidationError, calculate_calories,
                  client_summary, create_app, load_client, parse_client, programs,
-                 save_client, save_progress, setup_data, to_number)
+                 save_client, save_progress, setup_data, show_progress_chart, to_number)
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 WEEK_PATTERN = re.compile(r"^Week \d{2} - \d{4}$")
 
@@ -99,8 +101,8 @@ def test_client_summary_text():
     text = client_summary({"name": "Arjun", "age": 28, "weight": 80.0,
                            "program": "Fat Loss (FL)", "calories": 1760})
     assert text.startswith("CLIENT PROFILE\n--------------\n")
-    assert "Name     : Arjun" in text
-    assert "Calories : 1760 kcal/day" in text
+    assert "Name      : Arjun" in text
+    assert "Calories  : 1760 kcal/day" in text
 
 
 def test_save_progress_uses_week_label(db):
@@ -122,6 +124,23 @@ def test_save_progress_unknown_client(db):
         save_progress(db, "Nobody", 50)
 
 
+def test_show_progress_chart_returns_png(db):
+    save_client(db, parse_client(client_data()))
+    save_progress(db, "Arjun", 60, now=datetime(2026, 9, 1))
+    save_progress(db, "Arjun", 80, now=datetime(2026, 9, 8))
+    assert show_progress_chart(db, "Arjun").startswith(PNG_MAGIC)
+
+
+def test_show_progress_chart_requires_name(db):
+    with pytest.raises(ValidationError, match="Enter client name first"):
+        show_progress_chart(db, "")
+
+
+def test_show_progress_chart_without_data(db):
+    with pytest.raises(NotFoundError, match="No progress data available for this client"):
+        show_progress_chart(db, "Arjun")
+
+
 # ---------- web pages ----------
 
 def test_index_renders_panels(client):
@@ -134,7 +153,7 @@ def test_save_client_form_then_summary(client):
     res = client.post("/save_client", data=client_data(), follow_redirects=True)
     html = res.get_data(as_text=True)
     assert "Client data saved" in html
-    assert "Calories : 1760 kcal/day" in html
+    assert "Calories  : 1760 kcal/day" in html
 
 
 def test_save_client_form_error_keeps_fields(client):
@@ -152,7 +171,7 @@ def test_save_client_form_bad_number(client):
 def test_load_client_form(client):
     client.post("/save_client", data=client_data())
     res = client.post("/load_client", data={"name": "Arjun"}, follow_redirects=True)
-    assert "Name     : Arjun" in res.get_data(as_text=True)
+    assert "Name      : Arjun" in res.get_data(as_text=True)
 
 
 def test_load_client_form_not_found(client):
@@ -175,6 +194,28 @@ def test_save_progress_form(client):
 def test_save_progress_form_without_name(client):
     res = client.post("/save_progress", data={"name": "", "adherence": "85"},
                       follow_redirects=True)
+    assert "Enter client name first" in res.get_data(as_text=True)
+
+
+def test_view_progress_chart_form_shows_chart(client):
+    client.post("/save_client", data=client_data())
+    client.post("/save_progress", data={"name": "Arjun", "adherence": "85"})
+    res = client.post("/show_progress_chart", data={"name": "Arjun"}, follow_redirects=True)
+    html = res.get_data(as_text=True)
+    assert "Weekly Adherence Progress" in html
+    assert "/api/show_progress_chart/Arjun" in html
+
+
+def test_view_progress_chart_form_without_data(client):
+    client.post("/save_client", data=client_data())
+    res = client.post("/show_progress_chart", data={"name": "Arjun"}, follow_redirects=True)
+    html = res.get_data(as_text=True)
+    assert "No progress data available for this client" in html
+    assert "/api/show_progress_chart/" not in html
+
+
+def test_view_progress_chart_form_without_name(client):
+    res = client.post("/show_progress_chart", data={"name": ""}, follow_redirects=True)
     assert "Enter client name first" in res.get_data(as_text=True)
 
 
@@ -223,6 +264,16 @@ def test_api_save_progress(client):
 def test_api_save_progress_errors(client, payload, status):
     client.post("/api/save_client", json={"name": "Meena", "program": "Beginner (BG)"})
     assert client.post("/api/save_progress", json=payload).status_code == status
+
+
+def test_api_show_progress_chart(client):
+    client.post("/api/save_client", json={"name": "Meena", "program": "Beginner (BG)"})
+    assert client.get("/api/show_progress_chart/Meena").status_code == 404
+    client.post("/api/save_progress", json={"name": "Meena", "adherence": 65})
+    res = client.get("/api/show_progress_chart/Meena")
+    assert res.status_code == 200
+    assert res.mimetype == "image/png"
+    assert res.data.startswith(PNG_MAGIC)
 
 
 # ---------- errors ----------
