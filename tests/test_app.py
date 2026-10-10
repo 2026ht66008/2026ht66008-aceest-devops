@@ -1,4 +1,4 @@
-"""Tests for ACEest v2.2.4 - goals, workouts, exercises, body metrics, BMI and charts."""
+"""Tests for ACEest v3.0.1 - goals, workouts, exercises, body metrics, BMI and charts."""
 import re
 import sqlite3
 from datetime import date, datetime
