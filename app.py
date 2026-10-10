@@ -1,6 +1,7 @@
-"""ACEest Fitness & Performance - v2.0.1 (Flask port of Aceestver2.0.1.py).
+"""ACEest Fitness & Performance - v2.1.2 (Flask port of Aceestver-2.1.2.py).
 
-Same features as the Tkinter original:
+The original 2.1.2 script is identical to 2.0.1, so this release changes only the
+version number. Same features as the Tkinter original:
   * Client management form: name, age, weight, program, weekly adherence
   * Save Client: stores the client in SQLite (aceest_fitness.db) with the
     calculated daily calories (weight x program factor)
@@ -23,7 +24,7 @@ from datetime import datetime
 from flask import (Flask, current_app, flash, g, jsonify, redirect, render_template,
                    request, url_for)
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.2"
 APP_TITLE = "ACEest Fitness & Performance"
 HEADER_TEXT = "ACEest Functional Fitness System"
 DB_NAME = "aceest_fitness.db"
