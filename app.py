@@ -1,6 +1,7 @@
-"""ACEest Fitness & Performance - v2.2.4 (Flask port of Aceestver-2.2.4.py).
+"""ACEest Fitness & Performance - v3.0.1 (Flask port of Aceestver-3.0.1.py).
 
-Same features as the Tkinter original:
+The original 3.0.1 script is identical to 2.2.4, so this release changes only the
+version number. Same features as the Tkinter original:
   * Client list (select a saved client), client form with height, program and goals
     (target weight, target adherence)
   * Save Client / Load Client / Save Weekly Progress
@@ -32,7 +33,7 @@ from flask import (Flask, Response, current_app, flash, g, jsonify, redirect,
                    render_template, request, url_for)
 from matplotlib.figure import Figure
 
-APP_VERSION = "2.2.4"
+APP_VERSION = "3.0.1"
 APP_TITLE = "ACEest Fitness & Performance"
 HEADER_TEXT = "ACEest Functional Fitness System"
 DB_NAME = "aceest_fitness.db"
