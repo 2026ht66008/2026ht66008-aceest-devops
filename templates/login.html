@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Login – {{ app_title }}{% endblock %}
+{% block body %}
+<div class="login-box">
+  <fieldset class="panel">
+    <legend> Login </legend>
+    <form method="post" action="{{ url_for('login') }}">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" autofocus>
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password">
+
+      <div class="btn-col"><button class="btn" type="submit">Login</button></div>
+    </form>
+  </fieldset>
+</div>
+{% endblock %}
