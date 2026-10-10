@@ -1,4 +1,5 @@
 Flask>=3.0
 gunicorn>=22.0
+matplotlib>=3.8
 fpdf2>=2.7
 pytest>=8.0

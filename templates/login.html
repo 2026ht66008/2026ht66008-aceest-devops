@@ -1,10 +1,12 @@
 {% extends "base.html" %}
-{% block title %}Login – {{ app_title }}{% endblock %}
+{% block title %}ACEest Login{% endblock %}
+{% block header %}ACEest Fitness &amp; Performance{% endblock %}
 {% block body %}
 <div class="login-box">
+  <h2>ACEest Login</h2>
   <fieldset class="panel">
-    <legend> Login </legend>
-    <form method="post" action="{{ url_for('login') }}">
+    <legend> Sign in </legend>
+    <form method="post" action="{{ url_for('login_screen') }}">
       <label for="username">Username</label>
       <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" autofocus>
 
