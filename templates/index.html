@@ -1,44 +1,65 @@
 {% extends "base.html" %}
 {% block body %}
 <div class="layout">
-  <!-- Left panel: Client Profile -->
+  <!-- LEFT PANEL - CLIENT PROFILE -->
   <aside class="left">
     <fieldset class="panel">
       <legend> Client Profile </legend>
       <form method="get" action="{{ url_for('index') }}">
-        <label for="program">Select Program:</label>
+        <label for="name">Name</label>
+        <input id="name" name="name" type="text" value="{{ form.name }}">
+
+        <label for="age">Age</label>
+        <input id="age" name="age" type="number" min="0" step="1" value="{{ form.age }}">
+
+        <label for="weight">Weight (kg)</label>
+        <input id="weight" name="weight" type="number" min="0" step="0.1" value="{{ form.weight }}">
+
+        <label for="program">Program</label>
         <select id="program" name="program" onchange="this.form.submit()">
-          <option value="" disabled {% if not selected %}selected{% endif %}>-- choose a program --</option>
+          <option value="" {% if not form.program %}selected{% endif %}>-- choose a program --</option>
           {% for name in programs %}
-          <option value="{{ name }}" {% if name == selected %}selected{% endif %}>{{ name }}</option>
+          <option value="{{ name }}" {% if name == form.program %}selected{% endif %}>{{ name }}</option>
           {% endfor %}
         </select>
-        <button class="btn" type="submit">View Program</button>
+
+        <label for="adherence">Weekly Adherence (%):
+          <output class="range-value" id="adherence-value">{{ form.adherence or 0 }}</output></label>
+        <input id="adherence" name="adherence" type="range" min="0" max="100" step="1"
+               value="{{ form.adherence or 0 }}"
+               oninput="document.getElementById('adherence-value').value = this.value">
+
+        <div class="btn-col">
+          <button class="btn" type="submit">Show Plan</button>
+          <button class="btn" type="submit" formmethod="post" formaction="{{ url_for('save_client_form') }}">Save Client</button>
+          <a class="btn secondary" href="{{ url_for('index') }}">Reset</a>
+        </div>
       </form>
-      <!-- Site Metrics Summary (Reference) -->
-      <div class="metrics">{{ metrics_text }}</div>
     </fieldset>
   </aside>
 
-  <!-- Right panel: workout and diet charts -->
+  <!-- RIGHT PANEL - PROGRAM DETAILS -->
   <section class="right">
     <fieldset class="panel">
-      <legend> Weekly Workout Chart </legend>
-      {% if data %}
-      <pre class="display plan" style="color: {{ data.color }}">{{ data.workout }}</pre>
+      <legend> Weekly Training Plan </legend>
+      {% if plan %}
+      <pre class="display plan" style="color: {{ plan.color }}">{{ plan.workout }}</pre>
       {% else %}
-      <pre class="display plan placeholder">Select a profile to view workout</pre>
+      <pre class="display plan placeholder">Select a program to view the training plan</pre>
       {% endif %}
     </fieldset>
 
     <fieldset class="panel">
-      <legend> Daily Nutrition Plan (Tamil Nadu Context) </legend>
-      {% if data %}
-      <pre class="display plan">{{ data.diet }}</pre>
+      <legend> Nutrition Plan (TN Context) </legend>
+      {% if plan %}
+      <pre class="display plan">{{ plan.diet }}</pre>
       {% else %}
-      <pre class="display plan placeholder">Select a profile to view diet</pre>
+      <pre class="display plan placeholder">Select a program to view the nutrition plan</pre>
       {% endif %}
     </fieldset>
+
+    <p class="calories">Estimated Calories:
+      {% if plan and plan.calories %}{{ plan.calories }} kcal{% else %}--{% endif %}</p>
   </section>
 </div>
 {% endblock %}
