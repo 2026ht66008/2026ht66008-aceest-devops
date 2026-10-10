@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="layout">
+  <!-- Left panel: Client Profile -->
+  <aside class="left">
+    <fieldset class="panel">
+      <legend> Client Profile </legend>
+      <form method="get" action="{{ url_for('index') }}">
+        <label for="program">Select Program:</label>
+        <select id="program" name="program" onchange="this.form.submit()">
+          <option value="" disabled {% if not selected %}selected{% endif %}>-- choose a program --</option>
+          {% for name in programs %}
+          <option value="{{ name }}" {% if name == selected %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+        <button class="btn" type="submit">View Program</button>
+      </form>
+      <!-- Site Metrics Summary (Reference) -->
+      <div class="metrics">{{ metrics_text }}</div>
+    </fieldset>
+  </aside>
+
+  <!-- Right panel: workout and diet charts -->
+  <section class="right">
+    <fieldset class="panel">
+      <legend> Weekly Workout Chart </legend>
+      {% if data %}
+      <pre class="display plan" style="color: {{ data.color }}">{{ data.workout }}</pre>
+      {% else %}
+      <pre class="display plan placeholder">Select a profile to view workout</pre>
+      {% endif %}
+    </fieldset>
+
+    <fieldset class="panel">
+      <legend> Daily Nutrition Plan (Tamil Nadu Context) </legend>
+      {% if data %}
+      <pre class="display plan">{{ data.diet }}</pre>
+      {% else %}
+      <pre class="display plan placeholder">Select a profile to view diet</pre>
+      {% endif %}
+    </fieldset>
+  </section>
+</div>
+{% endblock %}
