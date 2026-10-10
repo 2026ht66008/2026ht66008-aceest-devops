@@ -1,4 +1,6 @@
 {% extends "base.html" %}
+{% block header %}ACEest Fitness Dashboard ({{ role }}){% endblock %}
+{% block nav %}<div class="nav">Signed in as {{ user }} &middot; <a href="{{ url_for('logout') }}">Logout</a></div>{% endblock %}
 {% block body %}
 <div class="layout">
   <!-- LEFT PANEL (client management) -->
@@ -38,31 +40,29 @@
           {% endfor %}
         </select>
 
-        <label for="target_weight">Target Weight (kg)</label>
-        <input id="target_weight" name="target_weight" type="number" min="0" step="0.1" value="{{ form.target_weight }}">
+        <label for="membership_expiry">Membership Expiry (YYYY-MM-DD)</label>
+        <input id="membership_expiry" name="membership_expiry" type="date" value="{{ form.membership_expiry }}">
 
-        <label for="target_adherence">Target Adherence %</label>
-        <input id="target_adherence" name="target_adherence" type="number" min="0" max="100" step="1" value="{{ form.target_adherence }}">
-
-        <label for="adherence">Weekly Adherence %:
-          <output class="range-value" id="adherence-value">{{ form.adherence or 0 }}</output></label>
-        <input id="adherence" name="adherence" type="range" min="0" max="100" step="1"
-               value="{{ form.adherence or 0 }}"
-               oninput="document.getElementById('adherence-value').value = this.value">
+        <label for="experience">Experience (for AI program)</label>
+        <select id="experience" name="experience">
+          {% for level in experience_levels %}
+          <option value="{{ level }}" {% if level == form.experience %}selected{% endif %}>{{ level }}</option>
+          {% endfor %}
+        </select>
 
         <div class="btn-col">
           <button class="btn" type="submit">Save Client</button>
           <button class="btn" type="submit" formaction="{{ url_for('load_client_form') }}">Load Client</button>
-          <button class="btn" type="submit" formaction="{{ url_for('save_progress_form') }}">Save Weekly Progress</button>
-          <button class="btn" type="submit" formmethod="get" formaction="{{ url_for('log_workout_page') }}">Log Workout</button>
-          <button class="btn" type="submit" formmethod="get" formaction="{{ url_for('log_metrics_page') }}">Log Body Metrics</button>
-          <button class="btn" type="submit" formmethod="get" formaction="{{ url_for('workout_history_page') }}">View Workout History</button>
+          <button class="btn" type="submit" formaction="{{ url_for('generate_ai_program_form') }}">Generate AI Program</button>
+          {% if current %}
+          <a class="btn" href="{{ url_for('export_pdf_report_download', client=current) }}">Export PDF Report</a>
+          {% endif %}
         </div>
       </form>
     </fieldset>
   </aside>
 
-  <!-- RIGHT PANEL with tabs -->
+  <!-- RIGHT PANEL (notebook for summary & program) -->
   <section class="right">
     <nav class="tabs">
       <a href="{{ url_for('index', client=current, tab='summary') }}" class="{{ 'active' if tab != 'analytics' }}">Client Summary</a>
@@ -72,33 +72,28 @@
     <div class="tab-body">
     {% if tab != 'analytics' %}
       {% if summary %}
-      <pre class="display">{{ summary.text }}</pre>
+      <pre class="display">{{ summary }}</pre>
       {% else %}
       <pre class="display placeholder">Select, save or load a client to see the summary</pre>
       {% endif %}
     {% else %}
-      {% if current %}
-      <div>
-        <a class="btn" href="{{ url_for('analytics', chart='progress', client=current) }}">Adherence Chart</a>
-        <a class="btn" href="{{ url_for('analytics', chart='weight', client=current) }}">Weight Trend Chart</a>
-        <a class="btn" href="{{ url_for('analytics', chart='bmi', client=current) }}">BMI &amp; Risk Info</a>
-      </div>
-      {% if chart == 'progress' %}
-      <fieldset class="panel chart"><legend> Weekly Adherence </legend>
-        <img src="{{ url_for('api_show_progress_chart', name=current) }}" alt="Weekly adherence chart for {{ current }}" width="800" height="400">
+      <fieldset class="panel">
+        <legend> AI Workout Program{% if ai_program %} – {{ ai_program.experience }}, {{ ai_program.focus }} focus{% endif %} </legend>
+        <div class="table-wrap">
+          <table class="grid">
+            <thead><tr><th>Day</th><th>Exercise</th><th>Sets</th><th>Reps</th></tr></thead>
+            <tbody>
+            {% if ai_program %}
+              {% for row in ai_program.rows %}
+              <tr><td>{{ row.day }}</td><td>{{ row.exercise }}</td><td>{{ row.sets }}</td><td>{{ row.reps }}</td></tr>
+              {% endfor %}
+            {% else %}
+              <tr><td class="empty" colspan="4">Select a client and click Generate AI Program</td></tr>
+            {% endif %}
+            </tbody>
+          </table>
+        </div>
       </fieldset>
-      {% elif chart == 'weight' %}
-      <fieldset class="panel chart"><legend> Weight Trend </legend>
-        <img src="{{ url_for('api_show_weight_chart', name=current) }}" alt="Weight trend chart for {{ current }}" width="800" height="400">
-      </fieldset>
-      {% elif chart == 'bmi' and bmi %}
-      <fieldset class="panel"><legend> BMI Info </legend>
-        <pre class="display">{{ bmi.message }}</pre>
-      </fieldset>
-      {% endif %}
-      {% else %}
-      <pre class="display placeholder">Select or load a client first</pre>
-      {% endif %}
     {% endif %}
     </div>
   </section>

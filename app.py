@@ -1,44 +1,54 @@
-"""ACEest Fitness & Performance - v3.0.1 (Flask port of Aceestver-3.0.1.py).
+"""ACEest Fitness & Performance - v3.1.2 (Flask port of Aceestver-3.1.2.py).
 
-The original 3.0.1 script is identical to 2.2.4, so this release changes only the
-version number. Same features as the Tkinter original:
-  * Client list (select a saved client), client form with height, program and goals
-    (target weight, target adherence)
-  * Save Client / Load Client / Save Weekly Progress
-  * Client Summary: profile, program notes, goals, progress summary, last body metrics
-  * Log Workout (session + one exercise), Log Body Metrics, View Workout History
-  * Progress & Analytics: adherence chart, weight trend chart, BMI & risk info
-  * Status bar showing the last action
+Same features as the Tkinter original:
+  * Login screen backed by a users table (default user admin / admin, role Admin)
+  * Dashboard titled with the user's role
+  * Client management: name, age, height, weight, program, membership expiry
+  * Save Client / Load Client and the Client Summary
+  * Generate AI Program: a weekly plan built from the client's goal and experience
+    level (beginner / intermediate / advanced)
+  * Export PDF Report for the selected client
 
-Change from the original: when an older database is found, missing columns are
-added (ALTER TABLE) instead of dropping the clients table, so no data is lost.
+Changes from the original (behaviour fixes, same features):
+  * Passwords are stored hashed (werkzeug), not as plain text; the default admin
+    password can be overridden with ACEEST_ADMIN_PASSWORD
+  * Saving a client no longer wipes its target weight / target adherence
+    (the original's INSERT OR REPLACE did); older databases are migrated in place
 
-Web pages:  GET  /                       -> dashboard (?client=<name>&tab=summary|analytics)
-            POST /save_client | /load_client | /save_progress
-            GET/POST /log_workout | /log_metrics,  GET /workout_history
-JSON API:   GET  /api/programs | /api/clients
-            POST /api/save_client | /api/save_progress | /api/log_workout | /api/log_metrics
-            GET  /api/load_client/<name> | /api/workout_history/<name>
-            GET  /api/show_progress_chart/<name> | /api/show_weight_chart/<name>  (PNG)
-            GET  /api/show_bmi_info/<name>
-Health:     GET  /health
+Web pages:  GET/POST /login, GET /logout
+            GET  /                          -> dashboard (?client=<name>&tab=summary|analytics)
+            POST /save_client | /load_client | /generate_ai_program
+            GET  /export_pdf_report?client=<name>
+JSON API:   POST /api/login | /api/logout
+            GET  /api/programs | /api/clients | /api/load_client/<name>
+            POST /api/save_client | /api/generate_ai_program
+            GET  /api/export_pdf_report/<name>   (PDF)
+Health:     GET  /health  (no login needed)
 """
-import io
+import functools
 import math
 import os
+import random
 import sqlite3
-from datetime import date, datetime
+from datetime import date
 
 from flask import (Flask, Response, current_app, flash, g, jsonify, redirect,
-                   render_template, request, url_for)
-from matplotlib.figure import Figure
+                   render_template, request, session, url_for)
+from fpdf import FPDF
+from werkzeug.security import check_password_hash, generate_password_hash
 
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.1.2"
 APP_TITLE = "ACEest Fitness & Performance"
-HEADER_TEXT = "ACEest Functional Fitness System"
+HEADER_TEXT = "ACEest Fitness Dashboard"
 DB_NAME = "aceest_fitness.db"
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password TEXT,
+    role TEXT
+);
 CREATE TABLE IF NOT EXISTS clients (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE,
@@ -48,7 +58,8 @@ CREATE TABLE IF NOT EXISTS clients (
     program TEXT,
     calories INTEGER,
     target_weight REAL,
-    target_adherence INTEGER
+    target_adherence INTEGER,
+    membership_expiry TEXT
 );
 CREATE TABLE IF NOT EXISTS progress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,14 +92,21 @@ CREATE TABLE IF NOT EXISTS metrics (
     bodyfat REAL
 );
 """
-# Columns the clients table must have (older databases get them added)
 CLIENT_COLUMNS = {"age": "INTEGER", "height": "REAL", "weight": "REAL", "program": "TEXT",
-                  "calories": "INTEGER", "target_weight": "REAL", "target_adherence": "INTEGER"}
+                  "calories": "INTEGER", "target_weight": "REAL", "target_adherence": "INTEGER",
+                  "membership_expiry": "TEXT"}
 CLIENT_FIELDS = ("name", "age", "height", "weight", "program", "calories",
-                 "target_weight", "target_adherence")
-FORM_FIELDS = ("name", "age", "height", "weight", "program", "target_weight",
-               "target_adherence", "adherence")
-WORKOUT_TYPES = ["Strength", "Hypertrophy", "Conditioning", "Mixed", "Mobility"]
+                 "target_weight", "target_adherence", "membership_expiry")
+FORM_FIELDS = ("name", "age", "height", "weight", "program", "membership_expiry", "experience")
+EXPERIENCE_LEVELS = ["beginner", "intermediate", "advanced"]
+
+exercises_pool = {
+    "Strength": ["Squat", "Deadlift", "Bench Press", "Overhead Press", "Pull-Up", "Barbell Row"],
+    "Hypertrophy": ["Leg Press", "Incline Dumbbell Press", "Lat Pulldown", "Lateral Raise",
+                    "Bicep Curl", "Tricep Extension"],
+    "Conditioning": ["Running", "Cycling", "Rowing", "Burpees", "Jump Rope", "Kettlebell Swings"],
+    "Full Body": ["Push-Up", "Pull-Up", "Lunge", "Plank", "Dumbbell Row", "Dumbbell Press"],
+}
 
 
 class ValidationError(ValueError):
@@ -96,18 +114,20 @@ class ValidationError(ValueError):
 
 
 class NotFoundError(LookupError):
-    """Missing client or data - warning on the page or HTTP 404 in the API."""
+    """Missing client - warning on the page or HTTP 404 in the API."""
 
 
 # ---------- DATABASE ----------
 
-def init_db(conn):
-    """Create all tables and add any columns missing from an older clients table."""
+def init_db(conn, admin_password="admin"):
+    """Create tables, migrate older client tables and add the default admin user."""
     conn.executescript(SCHEMA)
     existing = {row[1] for row in conn.execute("PRAGMA table_info(clients)")}
     for column, column_type in CLIENT_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE clients ADD COLUMN {column} {column_type}")
+    conn.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
+                 ("admin", generate_password_hash(admin_password), "Admin"))
     conn.commit()
 
 
@@ -159,13 +179,7 @@ def to_number(value, field, kind=float, maximum=None):
     return number
 
 
-def positive_or_none(number):
-    """The original stores 'not entered' (0) as NULL."""
-    return number if number > 0 else None
-
-
 def parse_date(value, field="Date"):
-    """Dates are stored as YYYY-MM-DD text, like the original."""
     value = (value or "").strip()
     if not value:
         return ""
@@ -173,6 +187,17 @@ def parse_date(value, field="Date"):
         return date.fromisoformat(value).isoformat()
     except ValueError:
         raise ValidationError(f"{field} must be in YYYY-MM-DD format") from None
+
+
+# ---------- LOGIN ----------
+
+def login_user(db, username, password):
+    """Return the user's role for valid credentials, otherwise None."""
+    row = db.execute("SELECT password, role FROM users WHERE username = ?",
+                     (str(username or "").strip(),)).fetchone()
+    if row and check_password_hash(row["password"], str(password or "").strip()):
+        return row["role"]
+    return None
 
 
 # ---------- CLIENTS ----------
@@ -188,27 +213,26 @@ def parse_client(data):
         "height": to_number(data.get("height"), "Height"),
         "weight": to_number(data.get("weight"), "Weight"),
         "program": (data.get("program") or "").strip(),
-        "target_weight": to_number(data.get("target_weight"), "Target weight"),
-        "target_adherence": to_number(data.get("target_adherence"), "Target adherence", int, 100),
+        "membership_expiry": parse_date(data.get("membership_expiry"), "Membership expiry"),
     }
 
 
 def save_client(db, client):
-    """Create or replace a client; values of 0 are stored as 'not set' (NULL)."""
+    """Create or update a client (calorie factor 25 when no program is chosen)."""
     if not client["name"]:
-        raise ValidationError("Name is required")
-    if not client["program"]:
-        raise ValidationError("Program is required")
-    if client["program"] not in programs:
+        raise ValidationError("Name required")
+    if client["program"] and client["program"] not in programs:
         raise ValidationError(f"Unknown program: {client['program']}")
-    weight = positive_or_none(client["weight"])
-    calories = int(weight * programs[client["program"]]["factor"]) if weight else None
+    factor = programs.get(client["program"], {}).get("factor", 25)
+    calories = int(client["weight"] * factor) if client["weight"] > 0 else None
     db.execute(
-        "INSERT OR REPLACE INTO clients (name, age, height, weight, program, calories, "
-        "target_weight, target_adherence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (client["name"], positive_or_none(client["age"]), positive_or_none(client["height"]),
-         weight, client["program"], calories, positive_or_none(client["target_weight"]),
-         positive_or_none(client["target_adherence"])),
+        "INSERT INTO clients (name, age, height, weight, program, calories, membership_expiry) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET age = excluded.age, height = excluded.height, "
+        "weight = excluded.weight, program = excluded.program, calories = excluded.calories, "
+        "membership_expiry = excluded.membership_expiry",
+        (client["name"], client["age"], client["height"], client["weight"], client["program"],
+         calories, client["membership_expiry"]),
     )
     db.commit()
     return "Client data saved"
@@ -222,198 +246,77 @@ def load_client(db, name):
     return dict(row)
 
 
-def ensure_client(db, name):
-    """Every per-client action needs a selected, existing client."""
+def refresh_summary(client):
+    return (f"Name: {client['name']}\n"
+            f"Age: {client['age']}\n"
+            f"Height: {client['height']} cm\n"
+            f"Weight: {client['weight']} kg\n"
+            f"Program: {client['program']}\n"
+            f"Membership Expiry: {client['membership_expiry']}")
+
+
+# ---------- AI PROGRAM GENERATOR ----------
+
+def generate_ai_program(db, name, exp_level, rng=random):
+    """Weekly plan: focus from the client's goal, volume from the experience level."""
     if not name:
-        raise ValidationError("Select or enter client first")
-    return load_client(db, name)
+        raise ValidationError("Select client first")
+    exp_level = (exp_level or "").strip().lower()
+    if exp_level not in EXPERIENCE_LEVELS:
+        raise ValidationError("Invalid experience level")
+    program_name = load_client(db, name)["program"] or ""
+
+    focus = "Full Body"
+    if "Fat Loss" in program_name:
+        focus = "Conditioning"
+    elif "Muscle Gain" in program_name:
+        focus = "Hypertrophy"
+
+    if exp_level == "beginner":
+        sets_range, reps_range, days = (2, 3), (8, 12), 3
+    elif exp_level == "intermediate":
+        sets_range, reps_range, days = (3, 4), (8, 15), 4
+    else:
+        sets_range, reps_range, days = (4, 5), (6, 15), 5
+
+    weekly_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][:days]
+    rows = []
+    for day in weekly_days:
+        for exercise in rng.sample(exercises_pool[focus], k=3 if days < 4 else 4):
+            rows.append({"day": day, "exercise": exercise,
+                         "sets": rng.randint(*sets_range), "reps": rng.randint(*reps_range)})
+    return {"client": name, "experience": exp_level, "focus": focus, "rows": rows}
 
 
-def dash(value):
-    return "-" if value is None else value
+# ---------- PDF REPORT ----------
+
+def pdf_safe(text):
+    """Core PDF fonts only cover Latin-1: swap dashes, replace anything else with '?'."""
+    text = str(text).replace("–", "-").replace("—", "-")
+    return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def refresh_summary(db, name):
-    """Everything shown in the Client Summary tab, plus the text block itself."""
+def export_pdf_report(db, name):
     client = load_client(db, name)
-    total_weeks, avg_adherence = db.execute(
-        "SELECT COUNT(*), AVG(adherence) FROM progress WHERE client_name = ?", (name,)
-    ).fetchone()
-    avg_adherence = round(avg_adherence, 1) if avg_adherence is not None else 0
-    last = db.execute(
-        "SELECT date, weight, waist, bodyfat FROM metrics WHERE client_name = ? "
-        "ORDER BY date DESC, id DESC LIMIT 1", (name,)
-    ).fetchone()
-    last_metric = dict(last) if last else None
-    last_metric_str = "None"
-    if last_metric:
-        last_metric_str = (f"{last_metric['date']} | {last_metric['weight']} kg, "
-                           f"Waist {last_metric['waist']} cm, Bodyfat {last_metric['bodyfat']}%")
-    goal_summary = "None"
-    if client["target_weight"] or client["target_adherence"]:
-        goal_summary = ""
-        if client["target_weight"]:
-            goal_summary += f"Target Weight: {client['target_weight']} kg; "
-        if client["target_adherence"]:
-            goal_summary += f"Target Adherence: {client['target_adherence']}%"
-    prog_desc = programs.get(client["program"], {}).get("desc", "")
-    text = "\n".join([
-        "CLIENT PROFILE", "--------------",
-        f"Name      : {client['name']}",
-        f"Age       : {dash(client['age'])}",
-        f"Height    : {dash(client['height'])} cm",
-        f"Weight    : {dash(client['weight'])} kg",
-        f"Program   : {client['program']}",
-        f"Calories  : {dash(client['calories'])} kcal/day",
-        "", "PROGRAM NOTES", "-------------", prog_desc,
-        "", "GOALS", "-----", goal_summary,
-        "", "PROGRESS SUMMARY", "----------------",
-        f"Weeks logged       : {total_weeks}",
-        f"Average adherence  : {avg_adherence}%",
-        "", "LAST BODY METRICS", "-----------------", last_metric_str,
-    ])
-    return {"client": client, "program_notes": prog_desc, "goals": goal_summary,
-            "weeks_logged": total_weeks, "average_adherence": avg_adherence,
-            "last_metrics": last_metric, "text": text}
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, pdf_safe(f"Client Report - {client['name']}"), align="C",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 12)
+    pdf.ln(10)
+    for label, value in (("Name", client["name"]), ("Age", client["age"]),
+                         ("Height", f"{client['height']} cm"),
+                         ("Weight", f"{client['weight']} kg"),
+                         ("Program", client["program"]),
+                         ("Membership Expiry", client["membership_expiry"])):
+        pdf.cell(0, 10, pdf_safe(f"{label}: {value}"), new_x="LMARGIN", new_y="NEXT")
+    return bytes(pdf.output())
 
 
-def save_progress(db, name, adherence, now=None):
-    if not name:
-        raise ValidationError("Enter client name first")
-    load_client(db, name)
-    week = (now or datetime.now()).strftime("Week %U - %Y")
-    db.execute("INSERT INTO progress (client_name, week, adherence) VALUES (?, ?, ?)",
-               (name, week, adherence))
-    db.commit()
-    return "Weekly progress logged", week
-
-
-# ---------- WORKOUTS & METRICS ----------
-
-def parse_exercise(data):
-    return {
-        "name": (data.get("name") or "").strip(),
-        "sets": to_number(data.get("sets"), "Sets", int),
-        "reps": to_number(data.get("reps"), "Reps", int),
-        "weight": to_number(data.get("weight"), "Exercise weight"),
-    }
-
-
-def log_workout(db, name, data, exercises=()):
-    """Save a workout session and its exercises (save_workout in the original)."""
-    ensure_client(db, name)
-    w_date = parse_date(data.get("date", date.today().isoformat()))
-    w_type = (data.get("workout_type") or "").strip()
-    if not w_date or not w_type:
-        raise ValidationError("Date and workout type are required")
-    if w_type not in WORKOUT_TYPES:
-        raise ValidationError(f"Unknown workout type: {w_type}")
-    duration = to_number(data.get("duration_min", 60), "Duration", int)
-    notes = (data.get("notes") or "").strip()
-    parsed = [parse_exercise(ex) for ex in exercises]
-    cur = db.execute(
-        "INSERT INTO workouts (client_name, date, workout_type, duration_min, notes) "
-        "VALUES (?, ?, ?, ?, ?)", (name, w_date, w_type, duration, notes))
-    workout_id = cur.lastrowid
-    for ex in parsed:
-        if ex["name"]:  # an exercise row is only saved when it has a name
-            db.execute("INSERT INTO exercises (workout_id, name, sets, reps, weight) "
-                       "VALUES (?, ?, ?, ?, ?)",
-                       (workout_id, ex["name"], ex["sets"], ex["reps"], ex["weight"]))
-    db.commit()
-    return "Workout logged successfully", workout_id
-
-
-def log_metrics(db, name, data):
-    """Save body metrics (save_metrics in the original)."""
-    ensure_client(db, name)
-    m_date = parse_date(data.get("date", date.today().isoformat()))
-    if not m_date:
-        raise ValidationError("Date is required")
-    values = [positive_or_none(to_number(data.get(key), label))
-              for key, label in (("weight", "Weight"), ("waist", "Waist"),
-                                 ("bodyfat", "Bodyfat"))]
-    db.execute("INSERT INTO metrics (client_name, date, weight, waist, bodyfat) "
-               "VALUES (?, ?, ?, ?, ?)", (name, m_date, *values))
-    db.commit()
-    return "Metrics logged successfully"
-
-
-def workout_history(db, name):
-    """Workouts newest first, each with its exercises."""
-    ensure_client(db, name)
-    rows = db.execute(
-        "SELECT id, date, workout_type, duration_min, notes FROM workouts "
-        "WHERE client_name = ? ORDER BY date DESC, id DESC", (name,)).fetchall()
-    history = []
-    for row in rows:
-        workout = dict(row)
-        workout["exercises"] = [dict(ex) for ex in db.execute(
-            "SELECT name, sets, reps, weight FROM exercises WHERE workout_id = ? ORDER BY id",
-            (row["id"],))]
-        history.append(workout)
-    return history
-
-
-# ---------- CHARTS / ANALYTICS ----------
-
-def line_chart_png(x, y, title, xlabel, ylabel, color=None, ylim=None):
-    fig = Figure(figsize=(8, 4))
-    ax = fig.subplots()
-    ax.plot(x, y, marker="o", linewidth=2, color=color)
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    if ylim:
-        ax.set_ylim(*ylim)
-    ax.grid(True)
-    ax.tick_params(axis="x", labelrotation=45)
-    fig.tight_layout()
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png")
-    return buffer.getvalue()
-
-
-def show_progress_chart(db, name):
-    ensure_client(db, name)
-    data = db.execute("SELECT week, adherence FROM progress WHERE client_name = ? ORDER BY id",
-                      (name,)).fetchall()
-    if not data:
-        raise NotFoundError("No progress data available for this client")
-    return line_chart_png([r["week"] for r in data], [r["adherence"] for r in data],
-                          f"Weekly Adherence – {name}", "Week", "Adherence (%)", ylim=(0, 100))
-
-
-def show_weight_chart(db, name):
-    ensure_client(db, name)
-    data = db.execute("SELECT date, weight FROM metrics WHERE client_name = ? "
-                      "AND weight IS NOT NULL ORDER BY date", (name,)).fetchall()
-    if not data:
-        raise NotFoundError("No weight metrics available for this client")
-    return line_chart_png([r["date"] for r in data], [r["weight"] for r in data],
-                          f"Weight Trend – {name}", "Date", "Weight (kg)", color="orange")
-
-
-def calculate_bmi(height_cm, weight_kg):
-    """BMI rounded to 1 decimal, its category and the coaching risk note."""
-    h_m = height_cm / 100.0
-    bmi = round(weight_kg / (h_m * h_m), 1)
-    if bmi < 18.5:
-        return bmi, "Underweight", "Potential nutrient deficiency, low energy."
-    if bmi < 25:
-        return bmi, "Normal", "Low risk if active and strong."
-    if bmi < 30:
-        return bmi, "Overweight", "Moderate risk; focus on adherence and progressive activity."
-    return bmi, "Obese", "Higher risk; prioritize fat loss, consistency, and supervision."
-
-
-def show_bmi_info(db, name):
-    client = ensure_client(db, name)
-    if not client["height"] or not client["weight"]:
-        raise ValidationError("Enter valid height and weight first")
-    bmi, category, risk = calculate_bmi(client["height"], client["weight"])
-    return {"bmi": bmi, "category": category, "risk": risk,
-            "message": f"BMI for {name}: {bmi} ({category})\n\nRisk note: {risk}"}
+def pdf_response(name, data):
+    return Response(data, mimetype="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="{pdf_safe(name)}_report.pdf"'})
 
 
 # ---------- APP ----------
@@ -424,53 +327,82 @@ def create_app(test_config=None):
     app.config.from_mapping(
         SECRET_KEY=os.environ.get("ACEEST_SECRET_KEY", "dev-only-change-me"),
         DATABASE=os.environ.get("ACEEST_DB", DB_NAME),
+        ADMIN_PASSWORD=os.environ.get("ACEEST_ADMIN_PASSWORD", "admin"),
     )
     if test_config:
         app.config.update(test_config)
 
     os.makedirs(os.path.dirname(os.path.abspath(app.config["DATABASE"])), exist_ok=True)
     conn = sqlite3.connect(app.config["DATABASE"])
-    init_db(conn)
+    init_db(conn, app.config["ADMIN_PASSWORD"])
     conn.close()
     app.teardown_appcontext(close_db)
 
     @app.context_processor
     def inject_globals():
-        return {"app_title": APP_TITLE, "header_text": HEADER_TEXT, "app_version": APP_VERSION}
+        return {"app_title": APP_TITLE, "header_text": HEADER_TEXT, "app_version": APP_VERSION,
+                "user": session.get("user"), "role": session.get("role")}
+
+    def login_required(view):
+        """Pages redirect to the login screen; API calls get HTTP 401."""
+        @functools.wraps(view)
+        def wrapped(*args, **kwargs):
+            if not session.get("user"):
+                if request.path.startswith("/api/"):
+                    return jsonify(error="Login required"), 401
+                return redirect(url_for("login"))
+            return view(*args, **kwargs)
+        return wrapped
 
     @app.get("/health")
     def health():
         get_db().execute("SELECT 1").fetchone()
         return jsonify(status="ok", app=APP_TITLE, version=APP_VERSION)
 
+    # ---------- WEB: LOGIN ----------
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            username = request.form.get("username", "")
+            role = login_user(get_db(), username, request.form.get("password", ""))
+            if role:
+                session.clear()
+                session["user"], session["role"] = username.strip(), role
+                return redirect(url_for("index"))
+            flash("Invalid credentials\nTry admin / admin", "error")
+            return render_template("login.html", username=username), 401
+        return render_template("login.html", username="")
+
+    @app.get("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
+
     # ---------- WEB: DASHBOARD ----------
     @app.get("/")
+    @login_required
     def index():
         db = get_db()
         form = {key: request.args.get(key, "") for key in FORM_FIELDS}
         name = request.args.get("client", "").strip()
         tab = request.args.get("tab", "summary")
-        chart = request.args.get("chart", "")
-        summary = bmi = None
+        summary = ai_program = None
         if name:
             try:
-                summary = refresh_summary(db, name)
+                client = load_client(db, name)
             except NotFoundError as err:
                 flash(str(err), "warning")
                 name = ""
             else:
-                for key in ("name", "age", "height", "weight", "program",
-                            "target_weight", "target_adherence"):
-                    value = summary["client"][key]
-                    form[key] = "" if value is None else value
-                if chart == "bmi":
-                    try:
-                        bmi = show_bmi_info(db, name)
-                    except ValidationError as err:
-                        flash(str(err), "warning")
+                for key in ("name", "age", "height", "weight", "program", "membership_expiry"):
+                    form[key] = "" if client[key] is None else client[key]
+                summary = refresh_summary(client)
+                stored = session.get("ai_program")
+                if stored and stored.get("client") == name:
+                    ai_program = stored
         return render_template("index.html", programs=programs, clients=refresh_client_list(db),
                                form=form, current=name, summary=summary, tab=tab,
-                               chart=chart, bmi=bmi)
+                               ai_program=ai_program, experience_levels=EXPERIENCE_LEVELS)
 
     def back_to_form(**extra):
         keep = {key: request.form.get(key, "") for key in FORM_FIELDS}
@@ -478,6 +410,7 @@ def create_app(test_config=None):
         return redirect(url_for("index", **keep))
 
     @app.post("/save_client")
+    @login_required
     def save_client_form():
         try:
             client = parse_client(request.form)
@@ -489,129 +422,76 @@ def create_app(test_config=None):
         return redirect(url_for("index", client=client["name"]))
 
     @app.post("/load_client")
+    @login_required
     def load_client_form():
         name = request.form.get("name", "").strip()
-        if not name:
-            flash("Enter or select client name first", "warning")
-            return back_to_form()
         try:
             load_client(get_db(), name)
         except NotFoundError as err:
             flash(str(err), "warning")
             return back_to_form()
-        flash(f"Loaded client: {name}", "status")
         return redirect(url_for("index", client=name))
 
-    @app.post("/save_progress")
-    def save_progress_form():
+    @app.post("/generate_ai_program")
+    @login_required
+    def generate_ai_program_form():
         name = request.form.get("name", "").strip()
         try:
-            adherence = to_number(request.form.get("adherence"), "Weekly adherence", int, 100)
-            message, _week = save_progress(get_db(), name, adherence)
+            plan = generate_ai_program(get_db(), name, request.form.get("experience"))
         except (ValidationError, NotFoundError) as err:
-            flash(str(err), "warning")
+            flash(str(err), "error")
             return back_to_form()
-        flash(message, "success")
-        flash(f"Saved weekly progress for {name}", "status")
-        return redirect(url_for("index", client=name))
+        session["ai_program"] = plan
+        flash("AI workout program generated!", "success")
+        flash(f"AI program generated for {name}", "status")
+        return redirect(url_for("index", client=name, tab="analytics",
+                                experience=plan["experience"]))
 
-    @app.get("/analytics/<chart>")
-    def analytics(chart):
-        """Adherence Chart / Weight Trend Chart / BMI & Risk Info buttons."""
+    @app.get("/export_pdf_report")
+    @login_required
+    def export_pdf_report_download():
         name = request.args.get("client", "").strip()
-        checks = {"progress": show_progress_chart, "weight": show_weight_chart,
-                  "bmi": show_bmi_info}
-        if chart not in checks:
-            return render_template("error.html", code=404, message="Unknown chart."), 404
         try:
-            checks[chart](get_db(), name)
-        except (ValidationError, NotFoundError) as err:
-            flash(str(err), "warning")
-            return redirect(url_for("index", client=name, tab="analytics"))
-        return redirect(url_for("index", client=name, tab="analytics", chart=chart))
-
-    # ---------- WEB: WORKOUTS & METRICS (the Toplevel windows) ----------
-    def selected_client():
-        return (request.args.get("client") or request.args.get("name") or "").strip()
-
-    def require_client_page():
-        name = selected_client()
-        try:
-            ensure_client(get_db(), name)
-        except (ValidationError, NotFoundError) as err:
-            flash(str(err), "warning")
-            return name, redirect(url_for("index", client=name) if name else url_for("index"))
-        return name, None
-
-    @app.route("/log_workout", methods=["GET", "POST"])
-    def log_workout_page():
-        name, problem = require_client_page()
-        if problem:
-            return problem
-        values = {"date": date.today().isoformat(), "workout_type": "", "duration_min": 60,
-                  "notes": "", "ex_name": "", "ex_sets": 3, "ex_reps": 10, "ex_weight": 0.0}
-        if request.method == "POST":
-            values.update(request.form.to_dict())
-            exercise = {"name": values["ex_name"], "sets": values["ex_sets"],
-                        "reps": values["ex_reps"], "weight": values["ex_weight"]}
-            try:
-                message, _id = log_workout(get_db(), name, request.form, [exercise])
-            except ValidationError as err:
-                flash(str(err), "error")
-                return render_template("log_workout.html", name=name, values=values,
-                                       workout_types=WORKOUT_TYPES), 400
-            flash(message, "success")
-            flash(f"Workout logged for {name}", "status")
-            return redirect(url_for("index", client=name))
-        return render_template("log_workout.html", name=name, values=values,
-                               workout_types=WORKOUT_TYPES)
-
-    @app.route("/log_metrics", methods=["GET", "POST"])
-    def log_metrics_page():
-        name, problem = require_client_page()
-        if problem:
-            return problem
-        current_weight = load_client(get_db(), name)["weight"] or 0.0
-        values = {"date": date.today().isoformat(), "weight": current_weight,
-                  "waist": 0.0, "bodyfat": 0.0}
-        if request.method == "POST":
-            values.update(request.form.to_dict())
-            try:
-                message = log_metrics(get_db(), name, request.form)
-            except ValidationError as err:
-                flash(str(err), "error")
-                return render_template("log_metrics.html", name=name, values=values), 400
-            flash(message, "success")
-            flash(f"Metrics logged for {name}", "status")
-            return redirect(url_for("index", client=name))
-        return render_template("log_metrics.html", name=name, values=values)
-
-    @app.get("/workout_history")
-    def workout_history_page():
-        name, problem = require_client_page()
-        if problem:
-            return problem
-        flash(f"Loaded workout history for {name}", "status")
-        return render_template("workout_history.html", name=name,
-                               workouts=workout_history(get_db(), name))
+            data = export_pdf_report(get_db(), name)
+        except NotFoundError:
+            flash("Select client first", "warning")
+            return redirect(url_for("index"))
+        return pdf_response(name, data)
 
     # ---------- JSON API ----------
     def api_error(err):
-        status = 404 if isinstance(err, NotFoundError) else 400
-        return jsonify(error=str(err)), status
+        return jsonify(error=str(err)), 404 if isinstance(err, NotFoundError) else 400
 
     def body():
         return request.get_json(silent=True) or {}
 
+    @app.post("/api/login")
+    def api_login():
+        data = body()
+        role = login_user(get_db(), data.get("username"), data.get("password"))
+        if not role:
+            return jsonify(error="Invalid credentials"), 401
+        session.clear()
+        session["user"], session["role"] = str(data["username"]).strip(), role
+        return jsonify(user=session["user"], role=role)
+
+    @app.post("/api/logout")
+    def api_logout():
+        session.clear()
+        return jsonify(message="Logged out")
+
     @app.get("/api/programs")
+    @login_required
     def api_programs():
         return jsonify(programs=programs)
 
     @app.get("/api/clients")
+    @login_required
     def api_clients():
         return jsonify(clients=refresh_client_list(get_db()))
 
     @app.post("/api/save_client")
+    @login_required
     def api_save_client():
         try:
             client = parse_client(body())
@@ -621,70 +501,35 @@ def create_app(test_config=None):
         return jsonify(message=message, client=load_client(get_db(), client["name"])), 201
 
     @app.get("/api/load_client/<path:name>")
+    @login_required
     def api_load_client(name):
         try:
-            return jsonify(refresh_summary(get_db(), name))
+            client = load_client(get_db(), name)
         except NotFoundError as err:
             return api_error(err)
+        return jsonify(client=client, summary=refresh_summary(client))
 
-    @app.post("/api/save_progress")
-    def api_save_progress():
+    @app.post("/api/generate_ai_program")
+    @login_required
+    def api_generate_ai_program():
         data = body()
+        seed = data.get("seed")
+        if seed is not None and not isinstance(seed, (int, str)):
+            return jsonify(error="seed must be a number or text"), 400
+        rng = random if seed is None else random.Random(seed)
         try:
-            adherence = to_number(data.get("adherence"), "Weekly adherence", int, 100)
-            message, week = save_progress(get_db(), (data.get("name") or "").strip(), adherence)
+            plan = generate_ai_program(get_db(), (data.get("name") or "").strip(),
+                                       data.get("experience"), rng)
         except (ValidationError, NotFoundError) as err:
             return api_error(err)
-        return jsonify(message=message, week=week, adherence=adherence), 201
+        return jsonify(plan)
 
-    @app.post("/api/log_workout")
-    def api_log_workout():
-        data = body()
-        exercises = data.get("exercises") or []
-        if not isinstance(exercises, list) or not all(isinstance(e, dict) for e in exercises):
-            return jsonify(error="exercises must be a list of objects"), 400
+    @app.get("/api/export_pdf_report/<path:name>")
+    @login_required
+    def api_export_pdf_report(name):
         try:
-            message, workout_id = log_workout(get_db(), (data.get("name") or "").strip(),
-                                              data, exercises)
-        except (ValidationError, NotFoundError) as err:
-            return api_error(err)
-        return jsonify(message=message, workout_id=workout_id), 201
-
-    @app.post("/api/log_metrics")
-    def api_log_metrics():
-        data = body()
-        try:
-            message = log_metrics(get_db(), (data.get("name") or "").strip(), data)
-        except (ValidationError, NotFoundError) as err:
-            return api_error(err)
-        return jsonify(message=message), 201
-
-    @app.get("/api/workout_history/<path:name>")
-    def api_workout_history(name):
-        try:
-            return jsonify(workouts=workout_history(get_db(), name))
+            return pdf_response(name, export_pdf_report(get_db(), name))
         except NotFoundError as err:
-            return api_error(err)
-
-    @app.get("/api/show_progress_chart/<path:name>")
-    def api_show_progress_chart(name):
-        try:
-            return Response(show_progress_chart(get_db(), name), mimetype="image/png")
-        except NotFoundError as err:
-            return api_error(err)
-
-    @app.get("/api/show_weight_chart/<path:name>")
-    def api_show_weight_chart(name):
-        try:
-            return Response(show_weight_chart(get_db(), name), mimetype="image/png")
-        except NotFoundError as err:
-            return api_error(err)
-
-    @app.get("/api/show_bmi_info/<path:name>")
-    def api_show_bmi_info(name):
-        try:
-            return jsonify(show_bmi_info(get_db(), name))
-        except (ValidationError, NotFoundError) as err:
             return api_error(err)
 
     # ---------- ERRORS ----------
