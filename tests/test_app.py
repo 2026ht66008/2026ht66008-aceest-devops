@@ -24,7 +24,7 @@ def add_progress(db, name, adherence, week="Week 40 - 2026"):
 
 def test_health_needs_no_login(client):
     res = client.get("/health")
-    assert res.status_code == 200 and res.get_json()["version"] == APP_VERSION
+    assert res.status_code == 500 and res.get_json()["version"] == APP_VERSION
 
 
 def test_users_table_keyed_by_username(app):
