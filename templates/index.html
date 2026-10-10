@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block header %}ACEest Fitness Dashboard ({{ role }}){% endblock %}
+{% block header %}ACEest Dashboard ({{ role }}){% endblock %}
 {% block nav %}<div class="nav">Signed in as {{ user }} &middot; <a href="{{ url_for('logout') }}">Logout</a></div>{% endblock %}
 {% block body %}
 <div class="layout">
-  <!-- LEFT PANEL (client management) -->
+  <!-- Left panel: Clients & program generator -->
   <aside class="left">
     <fieldset class="panel">
-      <legend> Client Management </legend>
+      <legend> Clients </legend>
 
       <form method="get" action="{{ url_for('index') }}">
         <label for="client">Select Client</label>
@@ -16,87 +16,68 @@
           <option value="{{ c }}" {% if c == current %}selected{% endif %}>{{ c }}</option>
           {% endfor %}
         </select>
+        <input type="hidden" name="tab" value="{{ tab }}">
         <noscript><button class="btn" type="submit">Open</button></noscript>
       </form>
 
-      <form method="post" action="{{ url_for('save_client_form') }}">
-        <label for="name">Name</label>
-        <input id="name" name="name" type="text" value="{{ form.name }}">
+      <form method="post" action="{{ url_for('add_save_client_form') }}">
+        <label for="name">Client Name</label>
+        <input id="name" name="name" type="text" placeholder="Enter client name">
+        <div class="btn-col"><button class="btn" type="submit">Add / Save Client</button></div>
+      </form>
 
-        <label for="age">Age</label>
-        <input id="age" name="age" type="number" min="0" step="1" value="{{ form.age }}">
-
-        <label for="height">Height (cm)</label>
-        <input id="height" name="height" type="number" min="0" step="0.1" value="{{ form.height }}">
-
-        <label for="weight">Weight (kg)</label>
-        <input id="weight" name="weight" type="number" min="0" step="0.1" value="{{ form.weight }}">
-
-        <label for="program">Program</label>
-        <select id="program" name="program">
-          <option value="" {% if not form.program %}selected{% endif %}>-- choose a program --</option>
-          {% for p in programs %}
-          <option value="{{ p }}" {% if p == form.program %}selected{% endif %}>{{ p }}</option>
-          {% endfor %}
-        </select>
-
-        <label for="membership_expiry">Membership Expiry (YYYY-MM-DD)</label>
-        <input id="membership_expiry" name="membership_expiry" type="date" value="{{ form.membership_expiry }}">
-
-        <label for="experience">Experience (for AI program)</label>
-        <select id="experience" name="experience">
-          {% for level in experience_levels %}
-          <option value="{{ level }}" {% if level == form.experience %}selected{% endif %}>{{ level }}</option>
-          {% endfor %}
-        </select>
-
+      {% if current %}
+      <form method="post">
+        <input type="hidden" name="client" value="{{ current }}">
         <div class="btn-col">
-          <button class="btn" type="submit">Save Client</button>
-          <button class="btn" type="submit" formaction="{{ url_for('load_client_form') }}">Load Client</button>
-          <button class="btn" type="submit" formaction="{{ url_for('generate_ai_program_form') }}">Generate AI Program</button>
-          {% if current %}
-          <a class="btn" href="{{ url_for('export_pdf_report_download', client=current) }}">Export PDF Report</a>
-          {% endif %}
+          <button class="btn" type="submit" formaction="{{ url_for('generate_program_form') }}">Generate AI Program</button>
+          <a class="btn" href="{{ url_for('generate_pdf_download', client=current) }}">Generate PDF Report</a>
+          <button class="btn" type="submit" formaction="{{ url_for('check_membership_form') }}">Check Membership</button>
         </div>
       </form>
+      {% else %}
+      <p class="placeholder">Select a client to generate a program, a PDF report or check membership.</p>
+      {% endif %}
     </fieldset>
   </aside>
 
-  <!-- RIGHT PANEL (notebook for summary & program) -->
+  <!-- Right panel: Notebook with summary/chart and workouts -->
   <section class="right">
     <nav class="tabs">
-      <a href="{{ url_for('index', client=current, tab='summary') }}" class="{{ 'active' if tab != 'analytics' }}">Client Summary</a>
-      <a href="{{ url_for('index', client=current, tab='analytics') }}" class="{{ 'active' if tab == 'analytics' }}">Progress &amp; Analytics</a>
+      <a href="{{ url_for('index', client=current, tab='summary') }}" class="{{ 'active' if tab != 'workouts' }}">Client Summary</a>
+      <a href="{{ url_for('index', client=current, tab='workouts') }}" class="{{ 'active' if tab == 'workouts' }}">Workouts &amp; Exercises</a>
     </nav>
 
     <div class="tab-body">
-    {% if tab != 'analytics' %}
+    {% if tab != 'workouts' %}
       {% if summary %}
       <pre class="display">{{ summary }}</pre>
+      {% if has_chart %}
+      <div class="chart"><img src="{{ url_for('api_plot_charts', name=current) }}" alt="Weekly adherence chart for {{ current }}" width="600" height="300"></div>
+      {% endif %}
       {% else %}
-      <pre class="display placeholder">Select, save or load a client to see the summary</pre>
+      <pre class="display placeholder">Select a client to see the summary</pre>
       {% endif %}
     {% else %}
-      <fieldset class="panel">
-        <legend> AI Workout Program{% if ai_program %} – {{ ai_program.experience }}, {{ ai_program.focus }} focus{% endif %} </legend>
-        <div class="table-wrap">
-          <table class="grid">
-            <thead><tr><th>Day</th><th>Exercise</th><th>Sets</th><th>Reps</th></tr></thead>
-            <tbody>
-            {% if ai_program %}
-              {% for row in ai_program.rows %}
-              <tr><td>{{ row.day }}</td><td>{{ row.exercise }}</td><td>{{ row.sets }}</td><td>{{ row.reps }}</td></tr>
-              {% endfor %}
-            {% else %}
-              <tr><td class="empty" colspan="4">Select a client and click Generate AI Program</td></tr>
-            {% endif %}
-            </tbody>
-          </table>
-        </div>
-      </fieldset>
+      {% if current %}
+      <div class="table-wrap">
+        <table class="grid">
+          <thead><tr><th>Date</th><th>Type</th><th>Duration</th><th>Notes</th></tr></thead>
+          <tbody>
+          {% for w in workouts %}
+            <tr><td>{{ w.date }}</td><td>{{ w.workout_type }}</td><td>{{ w.duration_min }}</td><td>{{ w.notes }}</td></tr>
+          {% else %}
+            <tr><td class="empty" colspan="4">No workouts yet</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div><a class="btn" href="{{ url_for('add_workout_page', client=current) }}">Add Workout</a></div>
+      {% else %}
+      <pre class="display placeholder">Select a client to see workouts</pre>
+      {% endif %}
     {% endif %}
     </div>
   </section>
 </div>
 {% endblock %}
-{% block status %}{% include "_status.html" %}{% endblock %}

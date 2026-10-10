@@ -1,32 +1,36 @@
-"""ACEest Fitness & Performance - v3.1.2 (Flask port of Aceestver-3.1.2.py).
+"""ACEest Fitness & Performance - v3.2.4 (Flask port of Aceestver-3.2.4.py).
 
 Same features as the Tkinter original:
-  * Login screen backed by a users table (default user admin / admin, role Admin)
+  * "ACEest Login" screen (users table, default admin / admin with role Admin)
   * Dashboard titled with the user's role
-  * Client management: name, age, height, weight, program, membership expiry
-  * Save Client / Load Client and the Client Summary
-  * Generate AI Program: a weekly plan built from the client's goal and experience
-    level (beginner / intermediate / advanced)
-  * Export PDF Report for the selected client
+  * Select a client to see the summary, the weekly adherence chart and workouts
+  * Add / Save Client (name only, membership status "Active")
+  * Generate AI Program: picks a program template and saves it on the client
+  * Generate PDF Report with every client field
+  * Check Membership: status and renewal date
+  * Workouts & Exercises tab: workout list and Add Workout
 
 Changes from the original (behaviour fixes, same features):
-  * Passwords are stored hashed (werkzeug), not as plain text; the default admin
-    password can be overridden with ACEEST_ADMIN_PASSWORD
-  * Saving a client no longer wipes its target weight / target adherence
-    (the original's INSERT OR REPLACE did); older databases are migrated in place
+  * "Add / Save Client" works (the original crashed: tkinter.simpledialog was
+    never imported)
+  * Passwords are stored hashed; ACEEST_ADMIN_PASSWORD overrides the default
+  * Older databases are migrated in place (missing columns added; a v3.1.2
+    membership_expiry is carried over to membership_end)
+  * Add Workout validates the date and workout type
 
 Web pages:  GET/POST /login, GET /logout
-            GET  /                          -> dashboard (?client=<name>&tab=summary|analytics)
-            POST /save_client | /load_client | /generate_ai_program
-            GET  /export_pdf_report?client=<name>
-JSON API:   POST /api/login | /api/logout
-            GET  /api/programs | /api/clients | /api/load_client/<name>
-            POST /api/save_client | /api/generate_ai_program
-            GET  /api/export_pdf_report/<name>   (PDF)
+            GET  /                        -> dashboard (?client=<name>&tab=summary|workouts)
+            POST /add_save_client | /generate_program | /check_membership
+            GET  /generate_pdf?client=<name>,  GET/POST /add_workout?client=<name>
+JSON API:   POST /api/login | /api/logout | /api/add_save_client | /api/generate_program
+                 /api/add_workout
+            GET  /api/clients | /api/load_client/<name> | /api/check_membership/<name>
+                 /api/refresh_workouts/<name> | /api/plot_charts/<name> (PNG)
+                 /api/generate_pdf/<name> (PDF)
 Health:     GET  /health  (no login needed)
 """
 import functools
-import math
+import io
 import os
 import random
 import sqlite3
@@ -35,17 +39,17 @@ from datetime import date
 from flask import (Flask, Response, current_app, flash, g, jsonify, redirect,
                    render_template, request, session, url_for)
 from fpdf import FPDF
+from matplotlib.figure import Figure
 from werkzeug.security import check_password_hash, generate_password_hash
 
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.2.4"
 APP_TITLE = "ACEest Fitness & Performance"
-HEADER_TEXT = "ACEest Fitness Dashboard"
+HEADER_TEXT = "ACEest Dashboard"
 DB_NAME = "aceest_fitness.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
+    username TEXT PRIMARY KEY,
     password TEXT,
     role TEXT
 );
@@ -59,7 +63,8 @@ CREATE TABLE IF NOT EXISTS clients (
     calories INTEGER,
     target_weight REAL,
     target_adherence INTEGER,
-    membership_expiry TEXT
+    membership_status TEXT,
+    membership_end TEXT
 );
 CREATE TABLE IF NOT EXISTS progress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,18 +99,19 @@ CREATE TABLE IF NOT EXISTS metrics (
 """
 CLIENT_COLUMNS = {"age": "INTEGER", "height": "REAL", "weight": "REAL", "program": "TEXT",
                   "calories": "INTEGER", "target_weight": "REAL", "target_adherence": "INTEGER",
-                  "membership_expiry": "TEXT"}
-CLIENT_FIELDS = ("name", "age", "height", "weight", "program", "calories",
-                 "target_weight", "target_adherence", "membership_expiry")
-FORM_FIELDS = ("name", "age", "height", "weight", "program", "membership_expiry", "experience")
-EXPERIENCE_LEVELS = ["beginner", "intermediate", "advanced"]
+                  "membership_status": "TEXT", "membership_end": "TEXT"}
+# Same column order as the original's SELECT * (used by the PDF report)
+CLIENT_FIELDS = ("id", "name", "age", "height", "weight", "program", "calories",
+                 "target_weight", "target_adherence", "membership_status", "membership_end")
+PDF_LABELS = ["ID", "Name", "Age", "Height", "Weight", "Program", "Calories", "Target Weight",
+              "Target Adherence", "Membership", "End"]
+WORKOUT_TYPES = ["Strength", "Hypertrophy", "Cardio", "Mobility"]
 
-exercises_pool = {
-    "Strength": ["Squat", "Deadlift", "Bench Press", "Overhead Press", "Pull-Up", "Barbell Row"],
-    "Hypertrophy": ["Leg Press", "Incline Dumbbell Press", "Lat Pulldown", "Lateral Raise",
-                    "Bicep Curl", "Tricep Extension"],
-    "Conditioning": ["Running", "Cycling", "Rowing", "Burpees", "Jump Rope", "Kettlebell Swings"],
-    "Full Body": ["Push-Up", "Pull-Up", "Lunge", "Plank", "Dumbbell Row", "Dumbbell Press"],
+# Programs for AI-style generation
+program_templates = {
+    "Fat Loss": ["Full Body HIIT", "Circuit Training", "Cardio + Weights"],
+    "Muscle Gain": ["Push/Pull/Legs", "Upper/Lower Split", "Full Body Strength"],
+    "Beginner": ["Full Body 3x/week", "Light Strength + Mobility"],
 }
 
 
@@ -117,18 +123,23 @@ class NotFoundError(LookupError):
     """Missing client - warning on the page or HTTP 404 in the API."""
 
 
-# ---------- DATABASE ----------
+# ---------- DATABASE INITIALIZATION ----------
 
-def init_db(conn, admin_password="admin"):
-    """Create tables, migrate older client tables and add the default admin user."""
+def init_db(db_name=DB_NAME, admin_password="admin"):
+    """Create tables, migrate older databases and add the default admin user."""
+    conn = sqlite3.connect(db_name)
     conn.executescript(SCHEMA)
     existing = {row[1] for row in conn.execute("PRAGMA table_info(clients)")}
     for column, column_type in CLIENT_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE clients ADD COLUMN {column} {column_type}")
+    if "membership_end" not in existing and "membership_expiry" in existing:
+        conn.execute("UPDATE clients SET membership_end = membership_expiry "
+                     "WHERE membership_end IS NULL")
     conn.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
                  ("admin", generate_password_hash(admin_password), "Admin"))
     conn.commit()
+    conn.close()
 
 
 def get_db():
@@ -145,53 +156,9 @@ def close_db(_exc=None):
         db.close()
 
 
-# ---------- DATA ----------
-
-def setup_data():
-    return {
-        "Fat Loss (FL) – 3 day": {"factor": 22, "desc": "3-day full-body fat loss"},
-        "Fat Loss (FL) – 5 day": {"factor": 24, "desc": "5-day split, higher volume fat loss"},
-        "Muscle Gain (MG) – PPL": {"factor": 35, "desc": "Push/Pull/Legs hypertrophy"},
-        "Beginner (BG)": {"factor": 26, "desc": "3-day simple beginner full-body"},
-    }
-
-
-programs = setup_data()
-
-
-# ---------- INPUT HELPERS ----------
-
-def to_number(value, field, kind=float, maximum=None):
-    """Convert form/JSON input to a non-negative number. Blank means 0 (like Tk IntVar)."""
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return kind(0)
-    try:
-        number = kind(value)
-    except (TypeError, ValueError):
-        number = None
-    if number is None or not math.isfinite(number):
-        word = "a whole number" if kind is int else "a number"
-        raise ValidationError(f"{field} must be {word}")
-    if number < 0:
-        raise ValidationError(f"{field} cannot be negative")
-    if maximum is not None and number > maximum:
-        raise ValidationError(f"{field} must be between 0 and {maximum}")
-    return number
-
-
-def parse_date(value, field="Date"):
-    value = (value or "").strip()
-    if not value:
-        return ""
-    try:
-        return date.fromisoformat(value).isoformat()
-    except ValueError:
-        raise ValidationError(f"{field} must be in YYYY-MM-DD format") from None
-
-
 # ---------- LOGIN ----------
 
-def login_user(db, username, password):
+def login(db, username, password):
     """Return the user's role for valid credentials, otherwise None."""
     row = db.execute("SELECT password, role FROM users WHERE username = ?",
                      (str(username or "").strip(),)).fetchone()
@@ -200,42 +167,21 @@ def login_user(db, username, password):
     return None
 
 
-# ---------- CLIENTS ----------
+# ---------- CLIENT MANAGEMENT ----------
 
 def refresh_client_list(db):
     return [row["name"] for row in db.execute("SELECT name FROM clients ORDER BY name")]
 
 
-def parse_client(data):
-    return {
-        "name": (data.get("name") or "").strip(),
-        "age": to_number(data.get("age"), "Age", int),
-        "height": to_number(data.get("height"), "Height"),
-        "weight": to_number(data.get("weight"), "Weight"),
-        "program": (data.get("program") or "").strip(),
-        "membership_expiry": parse_date(data.get("membership_expiry"), "Membership expiry"),
-    }
-
-
-def save_client(db, client):
-    """Create or update a client (calorie factor 25 when no program is chosen)."""
-    if not client["name"]:
-        raise ValidationError("Name required")
-    if client["program"] and client["program"] not in programs:
-        raise ValidationError(f"Unknown program: {client['program']}")
-    factor = programs.get(client["program"], {}).get("factor", 25)
-    calories = int(client["weight"] * factor) if client["weight"] > 0 else None
-    db.execute(
-        "INSERT INTO clients (name, age, height, weight, program, calories, membership_expiry) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(name) DO UPDATE SET age = excluded.age, height = excluded.height, "
-        "weight = excluded.weight, program = excluded.program, calories = excluded.calories, "
-        "membership_expiry = excluded.membership_expiry",
-        (client["name"], client["age"], client["height"], client["weight"], client["program"],
-         calories, client["membership_expiry"]),
-    )
+def add_save_client(db, name):
+    """Add a client with membership status Active (an existing client is left as it is)."""
+    name = (name or "").strip()
+    if not name:
+        raise ValidationError("Enter client name")
+    cur = db.execute("INSERT OR IGNORE INTO clients (name, membership_status) VALUES (?, ?)",
+                     (name, "Active"))
     db.commit()
-    return "Client data saved"
+    return f"Client {name} saved", cur.rowcount == 1
 
 
 def load_client(db, name):
@@ -246,46 +192,22 @@ def load_client(db, name):
     return dict(row)
 
 
-def refresh_summary(client):
-    return (f"Name: {client['name']}\n"
-            f"Age: {client['age']}\n"
-            f"Height: {client['height']} cm\n"
-            f"Weight: {client['weight']} kg\n"
-            f"Program: {client['program']}\n"
-            f"Membership Expiry: {client['membership_expiry']}")
-
-
-# ---------- AI PROGRAM GENERATOR ----------
-
-def generate_ai_program(db, name, exp_level, rng=random):
-    """Weekly plan: focus from the client's goal, volume from the experience level."""
+def ensure_client(db, name):
     if not name:
-        raise ValidationError("Select client first")
-    exp_level = (exp_level or "").strip().lower()
-    if exp_level not in EXPERIENCE_LEVELS:
-        raise ValidationError("Invalid experience level")
-    program_name = load_client(db, name)["program"] or ""
+        raise ValidationError("Select a client first")
+    return load_client(db, name)
 
-    focus = "Full Body"
-    if "Fat Loss" in program_name:
-        focus = "Conditioning"
-    elif "Muscle Gain" in program_name:
-        focus = "Hypertrophy"
 
-    if exp_level == "beginner":
-        sets_range, reps_range, days = (2, 3), (8, 12), 3
-    elif exp_level == "intermediate":
-        sets_range, reps_range, days = (3, 4), (8, 15), 4
-    else:
-        sets_range, reps_range, days = (4, 5), (6, 15), 5
+# ---------- AI-STYLE PROGRAM GENERATOR ----------
 
-    weekly_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][:days]
-    rows = []
-    for day in weekly_days:
-        for exercise in rng.sample(exercises_pool[focus], k=3 if days < 4 else 4):
-            rows.append({"day": day, "exercise": exercise,
-                         "sets": rng.randint(*sets_range), "reps": rng.randint(*reps_range)})
-    return {"client": name, "experience": exp_level, "focus": focus, "rows": rows}
+def generate_program(db, name, rng=random):
+    """Pick a random program template and save it as the client's program."""
+    ensure_client(db, name)
+    program_type = rng.choice(list(program_templates.keys()))
+    program_detail = rng.choice(program_templates[program_type])
+    db.execute("UPDATE clients SET program = ? WHERE name = ?", (program_detail, name))
+    db.commit()
+    return f"Program for {name}: {program_detail}", program_type, program_detail
 
 
 # ---------- PDF REPORT ----------
@@ -296,27 +218,87 @@ def pdf_safe(text):
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def export_pdf_report(db, name):
-    client = load_client(db, name)
+def generate_pdf(db, name):
+    client = ensure_client(db, name)
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, pdf_safe(f"Client Report - {client['name']}"), align="C",
-             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, pdf_safe(f"ACEest Client Report - {name}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 12)
-    pdf.ln(10)
-    for label, value in (("Name", client["name"]), ("Age", client["age"]),
-                         ("Height", f"{client['height']} cm"),
-                         ("Weight", f"{client['weight']} kg"),
-                         ("Program", client["program"]),
-                         ("Membership Expiry", client["membership_expiry"])):
-        pdf.cell(0, 10, pdf_safe(f"{label}: {value}"), new_x="LMARGIN", new_y="NEXT")
+    for label, field in zip(PDF_LABELS, CLIENT_FIELDS):
+        pdf.cell(0, 10, pdf_safe(f"{label}: {client[field]}"), new_x="LMARGIN", new_y="NEXT")
     return bytes(pdf.output())
 
 
 def pdf_response(name, data):
     return Response(data, mimetype="application/pdf", headers={
         "Content-Disposition": f'attachment; filename="{pdf_safe(name)}_report.pdf"'})
+
+
+# ---------- MEMBERSHIP ----------
+
+def check_membership(db, name):
+    client = ensure_client(db, name)
+    status, end = client["membership_status"], client["membership_end"]
+    return {"status": status, "end": end,
+            "message": f"Membership: {status}\nRenewal Date: {end if end else 'N/A'}"}
+
+
+# ---------- SUMMARY & CHARTS ----------
+
+def refresh_summary(client):
+    return (f"Name: {client['name']}\nProgram: {client['program']}\n"
+            f"Calories: {client['calories']}\nMembership: {client['membership_status']}")
+
+
+def plot_charts(db, name):
+    """PNG weekly adherence chart, or None when the client has no progress rows."""
+    data = db.execute("SELECT week, adherence FROM progress WHERE client_name = ? ORDER BY id",
+                      (name,)).fetchall()
+    if not data:
+        return None
+    fig = Figure(figsize=(6, 3))
+    ax = fig.subplots()
+    ax.plot([d["week"] for d in data], [d["adherence"] for d in data], marker="o")
+    ax.set_title("Weekly Adherence")
+    ax.set_ylabel("%")
+    ax.set_ylim(0, 100)
+    ax.grid(True)
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png")
+    return buffer.getvalue()
+
+
+# ---------- WORKOUTS ----------
+
+def refresh_workouts(db, name):
+    return [dict(r) for r in db.execute(
+        "SELECT date, workout_type, duration_min, notes FROM workouts WHERE client_name = ? "
+        "ORDER BY date DESC, id DESC", (name,))]
+
+
+def add_workout(db, name, data):
+    ensure_client(db, name)
+    w_date = (data.get("date") or "").strip()
+    try:
+        w_date = date.fromisoformat(w_date).isoformat()
+    except ValueError:
+        raise ValidationError("Date must be in YYYY-MM-DD format") from None
+    w_type = (data.get("workout_type") or "").strip()
+    if w_type not in WORKOUT_TYPES:
+        raise ValidationError("Choose a workout type: " + ", ".join(WORKOUT_TYPES))
+    try:
+        duration = int(data.get("duration_min") or 0)
+    except (TypeError, ValueError):
+        raise ValidationError("Duration must be a whole number") from None
+    if duration < 0:
+        raise ValidationError("Duration cannot be negative")
+    db.execute("INSERT INTO workouts (client_name, date, workout_type, duration_min, notes) "
+               "VALUES (?, ?, ?, ?, ?)",
+               (name, w_date, w_type, duration, (data.get("notes") or "").strip()))
+    db.commit()
+    return "Workout added"
 
 
 # ---------- APP ----------
@@ -333,9 +315,7 @@ def create_app(test_config=None):
         app.config.update(test_config)
 
     os.makedirs(os.path.dirname(os.path.abspath(app.config["DATABASE"])), exist_ok=True)
-    conn = sqlite3.connect(app.config["DATABASE"])
-    init_db(conn, app.config["ADMIN_PASSWORD"])
-    conn.close()
+    init_db(app.config["DATABASE"], app.config["ADMIN_PASSWORD"])
     app.teardown_appcontext(close_db)
 
     @app.context_processor
@@ -350,7 +330,7 @@ def create_app(test_config=None):
             if not session.get("user"):
                 if request.path.startswith("/api/"):
                     return jsonify(error="Login required"), 401
-                return redirect(url_for("login"))
+                return redirect(url_for("login_screen"))
             return view(*args, **kwargs)
         return wrapped
 
@@ -359,34 +339,34 @@ def create_app(test_config=None):
         get_db().execute("SELECT 1").fetchone()
         return jsonify(status="ok", app=APP_TITLE, version=APP_VERSION)
 
-    # ---------- WEB: LOGIN ----------
+    # ---------- WEB: LOGIN SCREEN ----------
     @app.route("/login", methods=["GET", "POST"])
-    def login():
+    def login_screen():
         if request.method == "POST":
             username = request.form.get("username", "")
-            role = login_user(get_db(), username, request.form.get("password", ""))
+            role = login(get_db(), username, request.form.get("password", ""))
             if role:
                 session.clear()
                 session["user"], session["role"] = username.strip(), role
                 return redirect(url_for("index"))
-            flash("Invalid credentials\nTry admin / admin", "error")
+            flash("Invalid credentials", "error")
             return render_template("login.html", username=username), 401
         return render_template("login.html", username="")
 
     @app.get("/logout")
     def logout():
         session.clear()
-        return redirect(url_for("login"))
+        return redirect(url_for("login_screen"))
 
     # ---------- WEB: DASHBOARD ----------
     @app.get("/")
     @login_required
     def index():
         db = get_db()
-        form = {key: request.args.get(key, "") for key in FORM_FIELDS}
         name = request.args.get("client", "").strip()
         tab = request.args.get("tab", "summary")
-        summary = ai_program = None
+        client = workouts = None
+        has_chart = False
         if name:
             try:
                 client = load_client(db, name)
@@ -394,69 +374,79 @@ def create_app(test_config=None):
                 flash(str(err), "warning")
                 name = ""
             else:
-                for key in ("name", "age", "height", "weight", "program", "membership_expiry"):
-                    form[key] = "" if client[key] is None else client[key]
-                summary = refresh_summary(client)
-                stored = session.get("ai_program")
-                if stored and stored.get("client") == name:
-                    ai_program = stored
-        return render_template("index.html", programs=programs, clients=refresh_client_list(db),
-                               form=form, current=name, summary=summary, tab=tab,
-                               ai_program=ai_program, experience_levels=EXPERIENCE_LEVELS)
+                workouts = refresh_workouts(db, name)
+                has_chart = db.execute("SELECT 1 FROM progress WHERE client_name = ? LIMIT 1",
+                                       (name,)).fetchone() is not None
+        return render_template("index.html", clients=refresh_client_list(db), current=name,
+                               client=client, summary=refresh_summary(client) if client else None,
+                               workouts=workouts, has_chart=has_chart, tab=tab)
 
-    def back_to_form(**extra):
-        keep = {key: request.form.get(key, "") for key in FORM_FIELDS}
-        keep.update(extra)
-        return redirect(url_for("index", **keep))
-
-    @app.post("/save_client")
+    @app.post("/add_save_client")
     @login_required
-    def save_client_form():
+    def add_save_client_form():
         try:
-            client = parse_client(request.form)
-            flash(save_client(get_db(), client), "success")
+            message, _created = add_save_client(get_db(), request.form.get("name"))
         except ValidationError as err:
-            flash(str(err), "error")
-            return back_to_form()
-        flash(f"Saved client: {client['name']}", "status")
-        return redirect(url_for("index", client=client["name"]))
-
-    @app.post("/load_client")
-    @login_required
-    def load_client_form():
-        name = request.form.get("name", "").strip()
-        try:
-            load_client(get_db(), name)
-        except NotFoundError as err:
             flash(str(err), "warning")
-            return back_to_form()
+            return redirect(url_for("index"))
+        flash(message, "success")
+        return redirect(url_for("index", client=request.form["name"].strip()))
+
+    @app.post("/generate_program")
+    @login_required
+    def generate_program_form():
+        name = request.form.get("client", "").strip()
+        try:
+            message, _type, _detail = generate_program(get_db(), name)
+        except (ValidationError, NotFoundError) as err:
+            flash(str(err), "warning")
+            return redirect(url_for("index"))
+        flash(message, "success")
         return redirect(url_for("index", client=name))
 
-    @app.post("/generate_ai_program")
+    @app.post("/check_membership")
     @login_required
-    def generate_ai_program_form():
-        name = request.form.get("name", "").strip()
+    def check_membership_form():
+        name = request.form.get("client", "").strip()
         try:
-            plan = generate_ai_program(get_db(), name, request.form.get("experience"))
+            flash(check_membership(get_db(), name)["message"], "info")
         except (ValidationError, NotFoundError) as err:
-            flash(str(err), "error")
-            return back_to_form()
-        session["ai_program"] = plan
-        flash("AI workout program generated!", "success")
-        flash(f"AI program generated for {name}", "status")
-        return redirect(url_for("index", client=name, tab="analytics",
-                                experience=plan["experience"]))
+            flash(str(err), "warning")
+            return redirect(url_for("index"))
+        return redirect(url_for("index", client=name))
 
-    @app.get("/export_pdf_report")
+    @app.get("/generate_pdf")
     @login_required
-    def export_pdf_report_download():
+    def generate_pdf_download():
         name = request.args.get("client", "").strip()
         try:
-            data = export_pdf_report(get_db(), name)
-        except NotFoundError:
-            flash("Select client first", "warning")
+            return pdf_response(name, generate_pdf(get_db(), name))
+        except (ValidationError, NotFoundError) as err:
+            flash(str(err), "warning")
             return redirect(url_for("index"))
-        return pdf_response(name, data)
+
+    @app.route("/add_workout", methods=["GET", "POST"])
+    @login_required
+    def add_workout_page():
+        name = request.args.get("client", "").strip()
+        try:
+            ensure_client(get_db(), name)
+        except (ValidationError, NotFoundError) as err:
+            flash(str(err), "warning")
+            return redirect(url_for("index"))
+        values = {"date": date.today().isoformat(), "workout_type": "", "duration_min": 60,
+                  "notes": ""}
+        if request.method == "POST":
+            values.update(request.form.to_dict())
+            try:
+                flash(add_workout(get_db(), name, request.form), "success")
+            except ValidationError as err:
+                flash(str(err), "error")
+                return render_template("add_workout.html", name=name, values=values,
+                                       workout_types=WORKOUT_TYPES), 400
+            return redirect(url_for("index", client=name, tab="workouts"))
+        return render_template("add_workout.html", name=name, values=values,
+                               workout_types=WORKOUT_TYPES)
 
     # ---------- JSON API ----------
     def api_error(err):
@@ -468,7 +458,7 @@ def create_app(test_config=None):
     @app.post("/api/login")
     def api_login():
         data = body()
-        role = login_user(get_db(), data.get("username"), data.get("password"))
+        role = login(get_db(), data.get("username"), data.get("password"))
         if not role:
             return jsonify(error="Invalid credentials"), 401
         session.clear()
@@ -480,25 +470,19 @@ def create_app(test_config=None):
         session.clear()
         return jsonify(message="Logged out")
 
-    @app.get("/api/programs")
-    @login_required
-    def api_programs():
-        return jsonify(programs=programs)
-
     @app.get("/api/clients")
     @login_required
     def api_clients():
         return jsonify(clients=refresh_client_list(get_db()))
 
-    @app.post("/api/save_client")
+    @app.post("/api/add_save_client")
     @login_required
-    def api_save_client():
+    def api_add_save_client():
         try:
-            client = parse_client(body())
-            message = save_client(get_db(), client)
+            message, created = add_save_client(get_db(), body().get("name"))
         except ValidationError as err:
             return api_error(err)
-        return jsonify(message=message, client=load_client(get_db(), client["name"])), 201
+        return jsonify(message=message, created=created), 201 if created else 200
 
     @app.get("/api/load_client/<path:name>")
     @login_required
@@ -507,30 +491,66 @@ def create_app(test_config=None):
             client = load_client(get_db(), name)
         except NotFoundError as err:
             return api_error(err)
-        return jsonify(client=client, summary=refresh_summary(client))
+        return jsonify(client=client, summary=refresh_summary(client),
+                       workouts=refresh_workouts(get_db(), name))
 
-    @app.post("/api/generate_ai_program")
+    @app.post("/api/generate_program")
     @login_required
-    def api_generate_ai_program():
+    def api_generate_program():
         data = body()
         seed = data.get("seed")
         if seed is not None and not isinstance(seed, (int, str)):
             return jsonify(error="seed must be a number or text"), 400
         rng = random if seed is None else random.Random(seed)
         try:
-            plan = generate_ai_program(get_db(), (data.get("name") or "").strip(),
-                                       data.get("experience"), rng)
+            message, program_type, detail = generate_program(
+                get_db(), (data.get("name") or "").strip(), rng)
         except (ValidationError, NotFoundError) as err:
             return api_error(err)
-        return jsonify(plan)
+        return jsonify(message=message, program_type=program_type, program=detail)
 
-    @app.get("/api/export_pdf_report/<path:name>")
+    @app.get("/api/generate_pdf/<path:name>")
     @login_required
-    def api_export_pdf_report(name):
+    def api_generate_pdf(name):
         try:
-            return pdf_response(name, export_pdf_report(get_db(), name))
+            return pdf_response(name, generate_pdf(get_db(), name))
         except NotFoundError as err:
             return api_error(err)
+
+    @app.get("/api/check_membership/<path:name>")
+    @login_required
+    def api_check_membership(name):
+        try:
+            return jsonify(check_membership(get_db(), name))
+        except NotFoundError as err:
+            return api_error(err)
+
+    @app.get("/api/plot_charts/<path:name>")
+    @login_required
+    def api_plot_charts(name):
+        png = plot_charts(get_db(), name)
+        if png is None:
+            return jsonify(error="No progress data available for this client"), 404
+        return Response(png, mimetype="image/png")
+
+    @app.get("/api/refresh_workouts/<path:name>")
+    @login_required
+    def api_refresh_workouts(name):
+        try:
+            ensure_client(get_db(), name)
+        except NotFoundError as err:
+            return api_error(err)
+        return jsonify(workouts=refresh_workouts(get_db(), name))
+
+    @app.post("/api/add_workout")
+    @login_required
+    def api_add_workout():
+        data = body()
+        try:
+            message = add_workout(get_db(), (data.get("name") or "").strip(), data)
+        except (ValidationError, NotFoundError) as err:
+            return api_error(err)
+        return jsonify(message=message), 201
 
     # ---------- ERRORS ----------
     def wants_json():
