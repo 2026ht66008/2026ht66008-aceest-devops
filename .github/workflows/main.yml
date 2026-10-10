@@ -1,0 +1,36 @@
+name: CI
+
+# Run on every push and every pull request
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install flake8
+
+      # Stage 1: Build & Lint
+      - name: Build & Lint
+        run: |
+          python -m py_compile app.py
+          flake8 .
+
+      # Stage 2: Docker image assembly
+      - name: Build the Docker image
+        run: docker build -t aceest-app .
+
+      # Stage 3: Run the Pytest suite inside the container
+      - name: Run tests inside the container
+        run: docker run --rm aceest-app python -m pytest -v
