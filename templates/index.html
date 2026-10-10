@@ -33,6 +33,7 @@
           <button class="btn" type="submit">Save Client</button>
           <button class="btn" type="submit" formaction="{{ url_for('load_client_form') }}">Load Client</button>
           <button class="btn" type="submit" formaction="{{ url_for('save_progress_form') }}">Save Progress</button>
+          <button class="btn" type="submit" formaction="{{ url_for('show_progress_chart_form') }}">View Progress Chart</button>
         </div>
       </form>
     </fieldset>
@@ -48,6 +49,13 @@
       <pre class="display placeholder">Save or load a client to see the summary</pre>
       {% endif %}
     </fieldset>
+
+    {% if show_chart %}
+    <fieldset class="panel chart">
+      <legend> Weekly Adherence Progress </legend>
+      <img src="{{ url_for('api_show_progress_chart', name=form.name) }}" alt="Line chart of weekly adherence for {{ form.name }}" width="800" height="400">
+    </fieldset>
+    {% endif %}
   </section>
 </div>
 {% endblock %}
