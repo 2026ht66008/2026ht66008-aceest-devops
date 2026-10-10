@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="layout">
+  <fieldset class="panel" style="flex:1">
+    <legend> {{ code }} </legend>
+    <p>{{ message }}</p>
+    <a class="btn" href="{{ url_for('index') }}">Back to dashboard</a>
+  </fieldset>
+</div>
+{% endblock %}
